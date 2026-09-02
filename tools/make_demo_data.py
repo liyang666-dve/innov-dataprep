@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """生成"假" LeRobot v2.1 数据集，用于克隆后自测（无需真实数据）。
 
-默认含刻意的脏数据，用于验证 01/02 的检出能力：
-  - ep 0: 1 个重复时间戳 + 1 处 3× 间隔（丢帧窗口）
+默认含刻意的脏数据，用于验证 01/02/03 的检出能力（每集一种）：
+  - ep 0: 1 个重复时间戳 + 1 处 10× 间隔（丢帧窗口）
   - ep 1: 状态列 2 个 NaN
   - ep 2: 视频比 parquet 多 1 帧（对齐 mismatch）
+  - ep 3: 关节相邻帧跳变（>0.8 rad）
+  - ep 4: 关节卡死（零方差 > 0.4s）
 加 --clean 可生成干净数据集。
 
 用法:
@@ -81,8 +83,8 @@ def write_episode(ds: Path, ep: int, n: int, fps: int, task_index: int,
     t0 = float(time.time()) - (n - 1) * dt  # 近期真实时刻，登记卡日期才可读
     if artifacts == "dup_gap":
         dts = [dt] * (n - 1)
-        dts[10] = 0.0          # 重复时间戳
-        dts[20] = 3.0 * dt     # 丢帧窗口
+        dts[10] = 0.0           # 重复时间戳
+        dts[20] = 10.0 * dt     # 大间隔 -> 丢帧窗口（估计丢 ~9 帧）
         ts = t0 + np.cumsum(np.concatenate([[0.0], dts]))
     else:
         ts = t0 + np.arange(n) * dt
@@ -95,6 +97,10 @@ def write_episode(ds: Path, ep: int, n: int, fps: int, task_index: int,
     if artifacts == "nan":
         state[5, 2] = np.nan
         state[12, 2] = np.nan
+    elif artifacts == "jump":
+        state[18, 1] += 1.2      # 相邻帧跳变 > 0.8 rad（left_1）
+    elif artifacts == "stuck":
+        state[14:29, 3] = state[14, 3]   # left_3 卡死 15 帧 ≈ 0.5s > 0.4s
 
     cols = {}
     for i, jn in enumerate(JOINT_NAMES):
@@ -115,7 +121,7 @@ def write_episode(ds: Path, ep: int, n: int, fps: int, task_index: int,
     ddir.mkdir(parents=True, exist_ok=True)
     df.to_parquet(ddir / f"episode_{ep:06d}.parquet", index=False)
 
-    extra = 1 if artifacts == "video_extra" else 0
+    extra = 3 if artifacts == "video_extra" else 0   # 尾部多 3 帧 -> 帧数不符
     write_videos(ds, cams := ["front", "left_wrist"], ep, n, fps, res, extra_frames=extra)
     return n
 
@@ -123,8 +129,8 @@ def write_episode(ds: Path, ep: int, n: int, fps: int, task_index: int,
 def main() -> int:
     ap = argparse.ArgumentParser(description="生成假 LeRobot v2.1 数据集（自测用）")
     ap.add_argument("--out", required=True, help="输出目录")
-    ap.add_argument("--episodes", type=int, default=3)
-    ap.add_argument("--frames", type=int, default=36)
+    ap.add_argument("--episodes", type=int, default=5)
+    ap.add_argument("--frames", type=int, default=120)
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--task", default="pick_and_place")
     ap.add_argument("--robot", default="bi_arx_x5")
@@ -143,7 +149,7 @@ def main() -> int:
     cams = ["front", "left_wrist"]
     task_index = 0
 
-    artifacts_seq = ["dup_gap", "nan", "video_extra"] if not args.clean else ["", "", ""]
+    artifacts_seq = ["dup_gap", "nan", "video_extra", "jump", "stuck"] if not args.clean else [""] * 5
     total_frames = 0
     ep_meta = []
     for ep in range(args.episodes):

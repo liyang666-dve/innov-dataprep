@@ -25,13 +25,17 @@ defaults:
   task: ""                  # 任务名可留空，优先从 meta/tasks.jsonl 读
 
 qc:
-  # —— 预留：03 清洗/质检阈值（暂未实现）——
-  min_duration_s: 3.0
-  fps_deviation: 0.15
-  blur_laplacian_thr: 3.0
-  joint_jump_rad: 1.0
-  stuck_s: 0.4
-  max_nan_ratio: 0.0
+  # 03 清洗/质检阈值（软标记；默认值同 pipe/03_clean.py 的 DEFAULT_QC）
+  min_duration_s: 3.0        # 短于此 -> 排除
+  max_duration_s: 120.0      # 长于此 -> 警告
+  fps_deviation: 0.15        # 实际帧率偏离标称超过 -> 排除
+  max_drop_ratio: 0.05       # 丢帧估计占行数超过 -> 排除
+  joint_limits_rad: 3.3      # |关节角| 超过 -> 排除
+  joint_jump_rad: 0.8        # 相邻帧跳变超过(rad) -> 排除
+  stuck_s: 0.4               # 关节零方差持续超过 -> 排除
+  blur_laplacian_thr: 3.0    # 帧 Laplacian 方差阈值（模糊判定，绝对阈值）
+  blur_bad_ratio: 0.10       # 低清晰帧占比超过 -> 排除（需 --blur 才启用）
+  blur_sample_frames: 200    # 每相机抽帧上限（控成本）
 
 annotate:
   # —— 预留：04 标注 LLM 建议（采集机能联网时启用；OpenAI 兼容接口，可填 DeepSeek/通义）——

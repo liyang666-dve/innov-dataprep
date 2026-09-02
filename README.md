@@ -7,8 +7,8 @@
 
 全部是命令行脚本，**克隆即用**：`git clone` → `bash setup.sh` → `cp config.example.yaml config.yaml` 改路径 → 按需跑脚本。
 
-> 目前实现：`01_inspect`（盘点）、`02_timestamps`（时间戳审计）、`ledger/record.py`（登记卡）、`ledger/aggregate.py`（台账汇总）、`tools/make_demo_data.py`（假数据自测）。
-> 后续：`03_clean → 04_annotate → 05_merge → 06_convert → 07_verify → 08_pack`（规划中）。
+> 目前实现：`01_inspect`（盘点）、`02_timestamps`（时间戳审计）、`03_clean`（清洗/质检，软标记）、`ledger/record.py`（登记卡）、`ledger/aggregate.py`（台账汇总）、`tools/make_demo_data.py`（假数据自测）。
+> 后续：`04_annotate → 05_merge → 06_convert → 07_verify → 08_pack`（规划中）。
 
 ---
 
@@ -32,9 +32,11 @@ cd innov-dataprep
 bash setup.sh                      # 复用 lerobot_arx_sdk311 环境；自研部分只依赖 numpy/pandas/pyarrow
 cp config.example.yaml config.yaml # 填你的路径 / 机器人映射 / 默认操作员等
 
-# 每批采集完，立即盘点 + 时间戳审计
+# 每批采集完，立即盘点 + 时间戳审计 + 质检（都是只读、当天发现当天处理）
 python3 pipe/01_inspect.py     --input /home/arx/robodeploy/output/arx/arx_0901_1500
 python3 pipe/02_timestamps.py  --input /home/arx/robodeploy/output/arx/arx_0901_1500
+python3 pipe/03_clean.py       --input /home/arx/robodeploy/output/arx/arx_0901_1500   # 默认不查模糊帧
+python3 pipe/03_clean.py       --input /home/arx/robodeploy/output/arx/arx_0901_1500 --blur  # 加查模糊帧(较慢)
 
 # 处理/合并完成后，登记这一批
 python3 ledger/record.py --batch /home/arx/robodeploy/output/arx/arx_0901_1500 --operator 张三 --yes
@@ -97,10 +99,10 @@ PYTHONPATH=/path/to/.pylibs python3 ledger/record.py --batch demo_data/arx_demo_
 
 - [x] 01 盘点（v2.1）
 - [x] 02 时间戳审计（只读）
+- [x] 03 清洗/质检（7+ 项检查 + 软标记，只读不删数据）
 - [x] 登记卡 + 台账 + 汇总
-- [ ] 03 清洗/质检（7 项检查 + 软标记）
 - [ ] 04 标注（指令模板 + LLM 建议 + 写回 tasks/parquet）
-- [ ] 05 合并（官方 merge，指定文件清单）
+- [ ] 05 合并（官方 merge，按 03 的 episode_disposition.csv 排除坏集，指定文件清单）
 - [ ] 06 转换 v2.1→v3.0（采集机，官方 converter）
 - [ ] 07 校验（v3.0 加载 smoke + 交付 sha256）
 - [ ] 08 打包传输（tar + sha256sums.txt）
