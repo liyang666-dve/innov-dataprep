@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "innov-dataprep"
+version = "0.1.0"
+description = "LeRobot dataset processing & registration pipeline (innov/ARX arms)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "pyarrow>=10.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+video = ["opencv-python-headless>=4.9", "imageio[ffmpeg]>=2.34"]
+excel = ["openpyxl>=3.1"]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+packages = ["pipe", "pipe.lib", "ledger", "tools"]

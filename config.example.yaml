@@ -1,0 +1,45 @@
+# innov-dataprep 配置模板 —— 拷成 config.yaml 后按机器填写
+# 注意：config.yaml 已被 .gitignore 排除，不会提交到仓库
+
+paths:
+  # 采集机批次目录（一轮采集 = 一个子目录：output/arx/arx_MMDD_HHMM）
+  batches: /home/arx/robodeploy/output/arx
+  # 处理输出根目录（各脚本默认写入 <input>/../<name>_<stage>/，可改这里）
+  output: /home/arx/dataprep_out
+  # 台账文件（本机记录每批登记，汇总脚本会合并各机台账）
+  ledger: /home/arx/data_catalog.csv
+
+# 机型映射：info.json 的 robot_type -> 登记模板里的机型（innov / arx / self / unk）
+robot_type_map:
+  bi_innov_arm_v1: innov
+  innov_arm: innov
+  bi_arx_x5: arx
+  arx_x5: arx
+  self: self
+
+defaults:
+  machine: 采集机A          # 采集机名称（登记卡自动带入，可确认时改）
+  operator: ""              # 操作员，留空则登记时输入
+  version: v1               # 数据版本
+  fps_nominal: 30           # 采集标称帧率（与 info.json 的 fps 不一致时以这里为准判断）
+  task: ""                  # 任务名可留空，优先从 meta/tasks.jsonl 读
+
+qc:
+  # —— 预留：03 清洗/质检阈值（暂未实现）——
+  min_duration_s: 3.0
+  fps_deviation: 0.15
+  blur_laplacian_thr: 3.0
+  joint_jump_rad: 1.0
+  stuck_s: 0.4
+  max_nan_ratio: 0.0
+
+annotate:
+  # —— 预留：04 标注 LLM 建议（采集机能联网时启用；OpenAI 兼容接口，可填 DeepSeek/通义）——
+  enabled: false
+  base_url: ""
+  model: ""
+  api_key_env: ""
+
+merge:
+  # —— 预留：05 合并，由你显式指定要合并的目录（2 个或 3 个）——
+  inputs: []

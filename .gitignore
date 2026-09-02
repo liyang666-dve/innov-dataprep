@@ -1,0 +1,29 @@
+# 配置：只提交 example，本机/采集机各自的 config.yaml 不入库
+config.yaml
+*.local.yaml
+
+# 数据与输出：绝不入库
+raw/
+out/
+demo_data/
+output/
+data_catalog*.csv
+*.zip
+*.tar*
+*.mp4
+*.parquet
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pylibs/
+*.egg-info/
+build/
+dist/
+
+# 系统 / 编辑器
+.DS_Store
+.idea/
+.vscode/
+*.log
