@@ -30,13 +30,15 @@ JOINT_NAMES = [f"left_{i}" for i in range(7)] + [f"right_{i}" for i in range(7)]
 
 
 def make_info(robot_type: str, fps: int, total_episodes: int, total_frames: int, cams: dict, res: tuple[int, int]) -> dict:
+    # features 里登记 video dtype 相机（对齐真实 robodeploy v2.1，05 合并靠它找相机）
+    features = {c: {"dtype": "video"} for c in cams}
     return {
-        "codebase_version": "2.1",
+        "codebase_version": "v2.1",
         "robot_type": robot_type,
         "fps": fps,
         "total_episodes": total_episodes,
         "total_frames": total_frames,
-        "features": {},
+        "features": features,
         "videos": {c: {"width": res[0], "height": res[1], "fps": fps} for c in cams},
     }
 

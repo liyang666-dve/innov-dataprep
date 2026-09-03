@@ -49,6 +49,29 @@ echo '{"fps":30}' > "$TMP/bogus/meta/info.json"
 RC3=$?
 [ $RC3 -ne 0 ] && ok "空数据集被拒绝(rc=$RC3)" || bad "空数据集应被拒绝，实际 rc=$RC3"
 
+echo "== 7/8 合并：带处置清单合并应排除脏集全部5集 =="
+MERGE_DISP="$TMP/out_dirty/episode_disposition.csv"
+"$PYTHON_BIN" pipe/05_merge.py --inputs "$TMP/clean" "$TMP/dirty" \
+    --output "$TMP/merged_excl" --overwrite \
+    --dispositions "" "$MERGE_DISP" >/dev/null 2>&1
+RC_M=$?
+ME=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open('$TMP/merged_excl/meta/info.json'))['total_episodes'])" 2>/dev/null || echo "?")
+[ $RC_M -eq 0 ] && [ "$ME" = "5" ] && ok "合并排除后=5集（实际 $ME）" || bad "合并排除后应为 5 集，实际 $ME rc=$RC_M"
+"$PYTHON_BIN" pipe/05_merge.py --inputs "$TMP/clean" "$TMP/dirty" \
+    --output "$TMP/merged_all" --overwrite --no-exclude >/dev/null 2>&1
+MA=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open('$TMP/merged_all/meta/info.json'))['total_episodes'])" 2>/dev/null || echo "?")
+[ "$MA" = "10" ] && ok "不排除合并=10集（实际 $MA）" || bad "不排除合并应为 10 集，实际 $MA"
+
+echo "== 8/8 合并防呆 + 产物回检 =="
+"$PYTHON_BIN" pipe/05_merge.py --inputs "$TMP/clean" --output "$TMP/x" --overwrite >/dev/null 2>&1
+[ $? -ne 0 ] && ok "单输入被拒绝" || bad "单输入应被拒绝"
+"$PYTHON_BIN" pipe/03_clean.py --input "$TMP/merged_excl" --out "$TMP/out_merged" >/dev/null 2>&1
+MC=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open('$TMP/out_merged/summary.json'))['n_exclude'])" 2>/dev/null || echo "?")
+[ "$MC" = "0" ] && ok "合并产物再过 03 全保留（排除 $MC）" || bad "合并产物再过 03 应为 0 排除，实际 $MC"
+"$PYTHON_BIN" pipe/05_merge.py --inputs "$TMP/clean" "$TMP/dirty" \
+    --output "$TMP/merged_excl" --dispositions "" "$MERGE_DISP" >/dev/null 2>&1
+[ $? -ne 0 ] && ok "输出目录已存在被拦（--overwrite 才能覆盖）" || bad "已存在输出应被拦截"
+
 echo
 echo "========================================"
 echo "自测结果: $pass 通过 / $fail 失败"

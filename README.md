@@ -7,8 +7,8 @@
 
 全部是命令行脚本，**克隆即用**：`git clone` → `bash setup.sh` → `cp config.example.yaml config.yaml` 改路径 → `python3 run.py` 菜单式操作。
 
-> 目前实现：`run.py`（总入口：菜单/短命令、扫批次、状态跟踪）、`01_inspect`（盘点）、`02_timestamps`（时间戳审计）、`03_clean`（清洗/质检，软标记）、`ledger/record.py`（登记卡）、`ledger/aggregate.py`（台账汇总）、`tools/make_demo_data.py`（假数据自测）、`tools/check_config.py`（配置体检）、`tools/self_test.sh`（一键自测）。
-> 后续：`04_annotate → 05_merge → 06_convert → 07_verify → 08_pack`（规划中）。
+> 目前实现：`run.py`（总入口：菜单/短命令、扫批次、状态跟踪）、`01_inspect`（盘点）、`02_timestamps`（时间戳审计）、`03_clean`（清洗/质检，软标记）、`05_merge`（合并，按 03 处置清单排除坏集）、`ledger/record.py`（登记卡）、`ledger/aggregate.py`（台账汇总）、`tools/make_demo_data.py`（假数据自测）、`tools/check_config.py`（配置体检）、`tools/self_test.sh`（一键自测）。
+> 后续：`04_annotate → 06_convert → 07_verify → 08_pack`（规划中）。
 
 ---
 
@@ -37,10 +37,12 @@ bash tools/self_test.sh              # 一键自测（推荐，防止"别台电�
 python3 run.py                       # 菜单：列批次 → 选动作 → 选批次编号，全程点选
 python3 run.py list                  # 只看批次+状态
 python3 run.py clean 1,2             # 清洗批次 1、2（编号见 list）
+python3 run.py merge 1,2,3           # 想合并哪些就合并哪些（任意勾选 ≥2 批）
 python3 run.py record 3              # 登记批次 3（数据处理达标后）
 
 # 或直接调底层脚本（精细控制时）
 python3 pipe/03_clean.py --input /home/arx/robodeploy/output/arx/arx_0901_1500 --blur
+python3 pipe/05_merge.py --inputs 目录A 目录B 目录C --output 合并名   # 显式指定合并
 ```
 
 **扫描范围**：`run.py` 只扫 `config.yaml → paths.batches` 目录下的**一层子目录**（不会全机器扫）；想扫别处 `python3 run.py list --path <目录>`。
@@ -70,7 +72,8 @@ innov-dataprep/
 │   ├── lib/report.py          # md/csv/json 报告写出
 │   ├── 01_inspect.py          # 盘点：逐集帧数/时长/帧率/时间戳/NaN/视频对齐
 │   ├── 02_timestamps.py       # 时间戳审计：单调性/重复/丢帧窗口（只报告不改数据）
-│   └── 03_clean.py            # 清洗/质检：7+ 项检查，软标记 keep/exclude（只读不删数据）
+│   ├── 03_clean.py            # 清洗/质检：7+ 项检查，软标记 keep/exclude（只读不删数据）
+│   └── 05_merge.py            # 合并：显式指定 ≥2 批，按 03 处置清单排除坏集，自动命名
 ├── ledger/                    # 数据管理模块（登记）
 │   ├── record.py              # 登记卡 → 台账 data_catalog.csv（默认 final 阶段：处理达标后）
 │   └── aggregate.py           # 多机台账合并汇总
@@ -96,7 +99,14 @@ innov-dataprep/
 └── videos/chunk-000/<cam>/episode_000000.mp4
 ```
 
-## 5. 登记（时机与字段）
+## 5. 合并（05）与登记（时机与字段）
+
+**合并（想合并哪些就合并哪些）**：`05_merge.py`（或 run.py 菜单"4 合并"）把**你勾选**的 ≥2 个 v2.1 批次合并成一份：
+- 自动按各批 `<批>_clean/episode_disposition.csv`（03 的处置清单）**排除坏集**；没有清单 → 全并入 + `[WARN]`；
+- 合并内核与你已验证的 merge_lerobot_v21_arx_bimanual.py 一致（重编号/index/task_index 重写、视频直拷、meta 全套重写）；
+- 安全校验：机型/帧率/features/chunks 不一致会拒绝合并；
+- 输出默认按公式自动命名（`{task}_{robot}_{首尾日期}_{N}cam_v{ver}`），也可 `--output` 指定；目录已存在会拦截（`--overwrite` 覆盖）；
+- 合并结果建议再过一次 `03_clean`（最终清洗）再进 06 转换。
 
 **登记时机（默认）**：数据处理**达标后**登记——即一批数据完成合并、转换、达标后，跑 `record.py`（或 run.py 菜单"6 登记"）对**最终数据集**生成登记卡：
 - `--stage final`（默认）：质量记 `clean`，一条台账 = 一个最终数据集；
@@ -128,10 +138,10 @@ PYTHONPATH=/path/to/.pylibs python3 run.py list --path demo_data
 - [x] 01 盘点（v2.1）
 - [x] 02 时间戳审计（只读）
 - [x] 03 清洗/质检（7+ 项检查 + 软标记，只读不删数据）
+- [x] 05 合并（显式勾选批次，按 03 处置清单排除坏集，自动命名）
 - [x] 登记（默认处理达标后 final 登记）+ 台账汇总
 - [x] 工具：配置体检 check_config、一键自测 self_test、环境兜底 setup.sh
 - [ ] 04 标注（指令模板 + LLM 建议 + 写回 tasks/parquet）
-- [ ] 05 合并（官方 merge，按 03 的 episode_disposition.csv 排除坏集，指定文件清单）
 - [ ] 06 转换 v2.1→v3.0（采集机，官方 converter）
 - [ ] 07 校验（v3.0 加载 smoke + 交付 sha256）
 - [ ] 08 打包传输（tar + sha256sums.txt）

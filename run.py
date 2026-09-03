@@ -30,14 +30,14 @@ sys.path.insert(0, str(ROOT))
 
 from pipe.lib import dataset_io  # noqa: E402
 
-STEPS = ["inspect", "timestamps", "clean", "record"]          # 已实现
-PENDING = ["merge", "convert", "verify", "pack"]               # 规划中（05-08）
+STEPS = ["inspect", "timestamps", "clean", "merge", "record"]   # 已实现
+PENDING = ["convert", "verify", "pack"]                          # 规划中（06-08）
 
 ACTION_MENU = [
     ("inspect", "盘点(01) 每集统计/视频对齐"),
     ("timestamps", "时间戳(02) 审计丢帧/回退"),
     ("clean", "清洗质检(03) 软标记坏集"),
-    ("merge", "合并(05) 按处置清单排除坏集 [待实现]"),
+    ("merge", "合并(05) 勾选若干批次按坏集排除并成一份"),
     ("convert", "转换 v2.1→v3.0 [待实现]"),
     ("record", "登记 处理达标后入台账"),
     ("aggregate", "汇总台账"),
@@ -48,6 +48,7 @@ SCRIPTS = {
     "inspect": "pipe/01_inspect.py",
     "timestamps": "pipe/02_timestamps.py",
     "clean": "pipe/03_clean.py",
+    "merge": "pipe/05_merge.py",
     "record": "ledger/record.py",
     "aggregate": "ledger/aggregate.py",
 }
@@ -135,7 +136,10 @@ def run_script(script: str, argv: list[str]) -> int:
 
 def pick_multi(batches: list[dict], prompt: str) -> list[dict]:
     while True:
-        raw = input(prompt).strip()
+        try:
+            raw = input(prompt).strip()
+        except (EOFError, KeyboardInterrupt):
+            return []
         if not raw:
             return []
         try:
@@ -160,6 +164,28 @@ def do_action(action: str, selected: list[dict], cfg: dict, args: argparse.Names
         d = args.aggregate_dir or str(ledger.parent)
         print(f"汇总目录: {d}（找 data_catalog*.csv）")
         return run_script(SCRIPTS["aggregate"], ["--dir", d])
+    if action == "merge":
+        v21 = [i for i in selected if i["kind"] == "v2.1"]
+        if len(v21) < 2:
+            print(f"[!] 合并至少需要 2 个 v2.1 批次（想合并哪些就勾哪些，至少 2 个）")
+            return 1
+        argv = ["--inputs", *[i["path"] for i in v21]]
+        if args.output:
+            argv += ["--output", args.output]
+        elif sys.stdin.isatty():
+            out_root = cfg.get("paths", {}).get("output")
+            if out_root:
+                name = input("输出目录名（回车自动生成）> ").strip()
+                if name:
+                    argv += ["--output", str(Path(out_root) / name)]
+        if (ROOT / "config.yaml").is_file():
+            argv += ["--config", str(ROOT / "config.yaml")]
+        rc = run_script(SCRIPTS["merge"], argv)
+        if rc == 0:
+            for info in v21:
+                mark(st, info["path"], "merge")
+            save_state(state_f, st)
+        return rc
     if action == "record":
         if len(selected) != 1:
             print("[!] 登记一次只处理一个批次，请重新选择")
@@ -170,8 +196,11 @@ def do_action(action: str, selected: list[dict], cfg: dict, args: argparse.Names
             return 1
         stage = args.stage
         if not stage:
-            stage = input("登记阶段?  1) final(处理后,默认)  2) raw(原始批次)  [回车=final] ").strip()
-            stage = "raw" if stage == "2" else "final"
+            try:
+                ans = input("登记阶段?  1) final(处理后,默认)  2) raw(原始批次)  [回车=final] ").strip()
+            except (EOFError, KeyboardInterrupt):
+                ans = ""
+            stage = "raw" if ans == "2" else "final"
         argv = ["--batch", info["path"], "--stage", stage]
         if (ROOT / "config.yaml").is_file():
             argv += ["--config", str(ROOT / "config.yaml")]
@@ -249,11 +278,12 @@ def cmd_list(cfg: dict, args: argparse.Namespace, st: dict) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(prog="run.py", description="innov-dataprep 总入口")
     ap.add_argument("cmd", nargs="?", default="menu",
-                    help="list / inspect / timestamps / clean / record / aggregate；空=交互菜单")
+                    help="list / inspect / timestamps / clean / merge / record / aggregate；空=交互菜单")
     ap.add_argument("indices", nargs="*", help="批次编号（list 里看到的），如 1,3")
     ap.add_argument("--path", default=None, help="扫描哪个目录（默认 config paths.batches）")
     ap.add_argument("--dirs", nargs="+", default=None, help="直接给数据集路径，跳过扫描")
     ap.add_argument("--stage", choices=["final", "raw"], default=None, help="record 阶段")
+    ap.add_argument("--output", default=None, help="合并输出目录（merge 用，默认自动命名）")
     ap.add_argument("--aggregate-dir", default=None, help="汇总台账所在目录")
     ap.add_argument("--state", default=None, help="状态文件路径")
     args = ap.parse_args()
