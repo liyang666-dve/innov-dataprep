@@ -7,8 +7,8 @@
 
 全部是命令行脚本，**克隆即用**：`git clone` → `bash setup.sh` → `cp config.example.yaml config.yaml` 改路径 → `python3 run.py` 菜单式操作。
 
-> 目前实现：`run.py`（总入口：菜单/短命令、扫批次、状态跟踪）、`01_inspect`（盘点）、`02_timestamps`（时间戳审计）、`03_clean`（清洗/质检，软标记）、`05_merge`（合并，按 03 处置清单排除坏集）、`ledger/record.py`（登记卡）、`ledger/aggregate.py`（台账汇总）、`tools/make_demo_data.py`（假数据自测）、`tools/check_config.py`（配置体检）、`tools/self_test.sh`（一键自测）。
-> 后续：`04_annotate → 06_convert → 07_verify → 08_pack`（规划中）。
+> 目前实现：`run.py`（总入口：菜单/短命令、扫批次、状态跟踪）、`01_inspect`（盘点）、`02_timestamps`（时间戳审计）、`03_clean`（清洗/质检，软标记）、`05_merge`（合并，按 03 处置清单排除坏集）、`06_convert`（v2.1→v3.0，调用官方转换器，自动留 v2.1 备份）、`ledger/record.py`（登记卡）、`ledger/aggregate.py`（台账汇总）、`tools/make_demo_data.py`（假数据自测）、`tools/check_config.py`（配置体检）、`tools/self_test.sh`（一键自测）。
+> 后续：`04_annotate → 07_verify → 08_pack`（规划中）。
 
 ---
 
@@ -38,6 +38,7 @@ python3 run.py                       # 菜单：列批次 → 选动作 → 选�
 python3 run.py list                  # 只看批次+状态
 python3 run.py clean 1,2             # 清洗批次 1、2（编号见 list）
 python3 run.py merge 1,2,3           # 想合并哪些就合并哪些（任意勾选 ≥2 批）
+python3 run.py convert 4             # 转 v3.0（选中输出组的合并产物，自动留 v2.1 备份）
 python3 run.py record 3              # 登记批次 3（数据处理达标后）
 
 # 或直接调底层脚本（精细控制时）
@@ -73,7 +74,8 @@ innov-dataprep/
 │   ├── 01_inspect.py          # 盘点：逐集帧数/时长/帧率/时间戳/NaN/视频对齐
 │   ├── 02_timestamps.py       # 时间戳审计：单调性/重复/丢帧窗口（只报告不改数据）
 │   ├── 03_clean.py            # 清洗/质检：7+ 项检查，软标记 keep/exclude（只读不删数据）
-│   └── 05_merge.py            # 合并：显式指定 ≥2 批，按 03 处置清单排除坏集，自动命名
+│   ├── 05_merge.py            # 合并：显式指定 ≥2 批，按 03 处置清单排除坏集，自动命名
+│   └── 06_convert.py          # 转换 v2.1→v3.0：调官方转换器（自动探测调用方式/留备份/补 stats）
 ├── ledger/                    # 数据管理模块（登记）
 │   ├── record.py              # 登记卡 → 台账 data_catalog.csv（默认 final 阶段：处理达标后）
 │   └── aggregate.py           # 多机台账合并汇总
@@ -108,6 +110,12 @@ innov-dataprep/
 - 输出默认按公式自动命名（`{task}_{robot}_{首尾日期}_{N}cam_v{ver}`），也可 `--output` 指定；目录已存在会拦截（`--overwrite` 覆盖）；
 - 合并结果建议再过一次 `03_clean`（最终清洗）再进 06 转换。
 
+**转换 v2.1→v3.0（06，采集机跑）**：`06_convert.py`（或 run.py 菜单"5 转换"）调用**官方转换器** `convert_dataset_v21_to_v30.py`：
+- 自动探测调用方式（`python -m lerobot.scripts.convert_dataset_v21_to_v30` / 包内脚本 / `~/lerobot` 源码目录），**必须在装有 lerobot 的 conda env 运行**（采集机 `lerobot_arx_sdk311`）；
+- 本地转换 `--push-to-hub=false`：转换后 v3.0 留在原目录，**原 v2.1 自动备份为 `<名字>_old`**；
+- 官方转换器**硬性要求 `meta/episodes_stats.jsonl`**（本仓库 05 合并/假数据/06 预检已保证，缺时 06 自动从 parquet 补算）；
+- `--check` 只预检不转换（v2.1? / stats? / 转换器在哪?），采集机上可先 `python3 pipe/06_convert.py --check --input <目录>` 确认就绪再转。
+
 **登记时机（默认）**：数据处理**达标后**登记——即一批数据完成合并、转换、达标后，跑 `record.py`（或 run.py 菜单"6 登记"）对**最终数据集**生成登记卡：
 - `--stage final`（默认）：质量记 `clean`，一条台账 = 一个最终数据集；
 - `--stage raw`（可选）：对每个原始采集批次登记，质量记 `raw`（保留"每批一行"粒度，不想记就不记，不阻塞主流程）。
@@ -139,10 +147,10 @@ PYTHONPATH=/path/to/.pylibs python3 run.py list --path demo_data
 - [x] 02 时间戳审计（只读）
 - [x] 03 清洗/质检（7+ 项检查 + 软标记，只读不删数据）
 - [x] 05 合并（显式勾选批次，按 03 处置清单排除坏集，自动命名）
+- [x] 06 转换 v2.1→v3.0（官方转换器，本地转换留 v2.1 备份，--check 预检）
 - [x] 登记（默认处理达标后 final 登记）+ 台账汇总
 - [x] 工具：配置体检 check_config、一键自测 self_test、环境兜底 setup.sh
 - [ ] 04 标注（指令模板 + LLM 建议 + 写回 tasks/parquet）
-- [ ] 06 转换 v2.1→v3.0（采集机，官方 converter）
 - [ ] 07 校验（v3.0 加载 smoke + 交付 sha256）
 - [ ] 08 打包传输（tar + sha256sums.txt）
 

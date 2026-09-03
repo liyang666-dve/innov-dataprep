@@ -30,15 +30,15 @@ sys.path.insert(0, str(ROOT))
 
 from pipe.lib import dataset_io  # noqa: E402
 
-STEPS = ["inspect", "timestamps", "clean", "merge", "record"]   # 已实现
-PENDING = ["convert", "verify", "pack"]                          # 规划中（06-08）
+STEPS = ["inspect", "timestamps", "clean", "merge", "convert", "record"]  # 已实现
+PENDING = ["verify", "pack"]                                              # 规划中（07-08）
 
 ACTION_MENU = [
     ("inspect", "盘点(01) 每集统计/视频对齐"),
     ("timestamps", "时间戳(02) 审计丢帧/回退"),
     ("clean", "清洗质检(03) 软标记坏集"),
     ("merge", "合并(05) 勾选若干批次按坏集排除并成一份"),
-    ("convert", "转换 v2.1→v3.0 [待实现]"),
+    ("convert", "转换(06) v2.1→v3.0 官方转换器(自动留 v2.1 备份)"),
     ("record", "登记 处理达标后入台账"),
     ("aggregate", "汇总台账"),
     ("quit", "退出"),
@@ -49,6 +49,7 @@ SCRIPTS = {
     "timestamps": "pipe/02_timestamps.py",
     "clean": "pipe/03_clean.py",
     "merge": "pipe/05_merge.py",
+    "convert": "pipe/06_convert.py",
     "record": "ledger/record.py",
     "aggregate": "ledger/aggregate.py",
 }
@@ -83,6 +84,27 @@ def scan_batches(root: Path) -> list[dict]:
     return out
 
 
+def scan_roots(cfg: dict, path_override: str | None) -> list[dict]:
+    """可选项列表 = batches 目录下全部 + output 目录下的 v2.1（合并产物/待转换）。
+
+    想扫别处仍用 --path 只扫那个目录。返回绝对路径条目（group: 批次/输出）。
+    """
+    items = []
+    root = Path(path_override or cfg.get("paths", {}).get("batches") or "").expanduser()
+    if root.is_dir():
+        items = scan_batches(root)
+        for i in items:
+            i.setdefault("group", "批次")
+    if not path_override:
+        out_root = Path(cfg.get("paths", {}).get("output") or "").expanduser()
+        if out_root.is_dir() and out_root.resolve() != root.resolve():
+            outs = [i for i in scan_batches(out_root) if i["kind"] == "v2.1"]
+            for i in outs:
+                i["group"] = "输出"
+            items = items + outs
+    return items
+
+
 def state_path(cfg: dict, override: str | None) -> Path:
     p = override or cfg.get("paths", {}).get("output")
     return Path(p).expanduser() if p else (ROOT / ".dataprep_state.json")
@@ -112,7 +134,7 @@ def fmt_row(idx: int, info: dict, st: dict) -> str:
     if info["kind"] != "v2.1":
         return f"  [{idx}] {info['name']:<34} — 不可用: {info['reason']}"
     s = st.get(key, {})
-    status = "  ".join(f"{n}✓" for n in ("inspect", "timestamps", "clean", "record") if s.get(n))
+    status = "  ".join(f"{n}✓" for n in ("inspect", "timestamps", "clean", "merge", "record") if s.get(n))
     info_l = ""
     if info.get("n_episodes") is not None:
         info_l = f"{info['n_episodes']}集 {info['fps']:g}fps {info['robot_type']}"
@@ -121,8 +143,13 @@ def fmt_row(idx: int, info: dict, st: dict) -> str:
 
 def show_batches(batches: list[dict], st: dict) -> None:
     print("-" * 70)
-    print("批次目录下的数据（只扫 path.batches 这一层）：")
+    cur = None
     for i, info in enumerate(batches, 1):
+        g = info.get("group", "批次")
+        if g != cur:
+            cur = g
+            label = "采集批次（paths.batches）" if g == "批次" else "已处理输出（paths.output，v2.1）"
+            print(f"◆ {label}")
         print(fmt_row(i, info, st))
     print("-" * 70)
 
@@ -184,6 +211,20 @@ def do_action(action: str, selected: list[dict], cfg: dict, args: argparse.Names
         if rc == 0:
             for info in v21:
                 mark(st, info["path"], "merge")
+            save_state(state_f, st)
+        return rc
+    if action == "convert":
+        v21 = [i for i in selected if i["kind"] == "v2.1"]
+        if len(v21) != 1:
+            print("[!] 转换一次只处理一个 v2.1 数据集（通常是列表『输出』组的合并产物）")
+            return 1
+        info = v21[0]
+        argv = ["--input", info["path"]]
+        if not sys.stdin.isatty():  # 非交互场景自动确认
+            argv += ["--yes"]
+        rc = run_script(SCRIPTS["convert"], argv)
+        if rc == 0:
+            mark(st, info["path"], "convert")
             save_state(state_f, st)
         return rc
     if action == "record":
@@ -248,42 +289,41 @@ def resolve_indices(batches: list[dict], tokens: list[str]) -> list[dict] | None
 
 def cmd_clean(cfg: dict, args: argparse.Namespace, state_f: Path, st: dict) -> int:
     if args.dirs:
-        batches = [dataset_io.summarize_light(Path(d)) for d in args.dirs]
-        selected = batches
+        selected = [dataset_io.summarize_light(Path(d)) for d in args.dirs]
     else:
-        root = Path(args.path or cfg.get("paths", {}).get("batches") or "")
-        batches = scan_batches(root) if root else []
-        if not batches:
-            print("[ERROR] 未扫到批次。检查 config.yaml 的 paths.batches，或用 --path / --dirs 指定")
+        items = scan_roots(cfg, args.path)
+        if not items:
+            print("[ERROR] 未扫到数据。检查 config.yaml 的 paths.batches，或用 --path / --dirs 指定")
             return 1
         if not args.indices:
-            print(f"[ERROR] 请给批次编号，例如: python3 run.py {args.cmd} 1,2")
-            print("       先跑 python3 run.py list 查看编号")
+            print(f"[ERROR] 请给编号，例如: python3 run.py {args.cmd} 1,2（编号见 run.py list）")
             return 1
-        selected = resolve_indices(batches, args.indices)
+        selected = resolve_indices(items, args.indices)
         if selected is None:
             return 1
     return do_action(args.cmd, selected, cfg, args, st, state_f)
 
 
 def cmd_list(cfg: dict, args: argparse.Namespace, st: dict) -> int:
-    root = Path(args.path or cfg.get("paths", {}).get("batches") or "").expanduser()
-    if not root or not root.is_dir():
-        print(f"[ERROR] 批次目录不可用: {root}（先配置 config.yaml paths.batches，或 --path 指定）")
+    items = scan_roots(cfg, args.path)
+    if not items:
+        print("[ERROR] 没有可列出的数据：先配置 config.yaml 的 paths.batches（合并产物放 paths.output），"
+              "或用 --path 指定目录")
         return 1
-    show_batches(scan_batches(root), st)
+    show_batches(items, st)
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="run.py", description="innov-dataprep 总入口")
     ap.add_argument("cmd", nargs="?", default="menu",
-                    help="list / inspect / timestamps / clean / merge / record / aggregate；空=交互菜单")
-    ap.add_argument("indices", nargs="*", help="批次编号（list 里看到的），如 1,3")
+                    help="list / inspect / timestamps / clean / merge / convert / record / aggregate；空=交互菜单")
+    ap.add_argument("indices", nargs="*", help="数据编号（list 里看到的），如 1,3")
     ap.add_argument("--path", default=None, help="扫描哪个目录（默认 config paths.batches）")
     ap.add_argument("--dirs", nargs="+", default=None, help="直接给数据集路径，跳过扫描")
     ap.add_argument("--stage", choices=["final", "raw"], default=None, help="record 阶段")
     ap.add_argument("--output", default=None, help="合并输出目录（merge 用，默认自动命名）")
+    ap.add_argument("--yes", action="store_true", help="非交互场景自动确认（convert/record 用）")
     ap.add_argument("--aggregate-dir", default=None, help="汇总台账所在目录")
     ap.add_argument("--state", default=None, help="状态文件路径")
     args = ap.parse_args()
@@ -293,13 +333,12 @@ def main() -> int:
     st = load_state(state_f)
 
     if args.cmd == "menu":
-        root = Path(args.path or cfg.get("paths", {}).get("batches") or "")
-        batches = scan_batches(root) if root else []
-        if not batches:
-            print("[!] 未扫到批次（先配置 config.yaml paths.batches，或 --path 指定目录后重试）")
+        items = scan_roots(cfg, args.path)
+        if not items:
+            print("[!] 没有可处理的数据（先配置 config.yaml 的 paths.batches，或 --path 指定目录后重试）")
             return 1
         while True:
-            show_batches(batches, st)
+            show_batches(items, st)
             print("你想做什么？")
             for i, (name, desc) in enumerate(ACTION_MENU, 1):
                 tag = "" if name in STEPS + ["aggregate", "quit"] else " (待实现)"
@@ -322,7 +361,7 @@ def main() -> int:
             if action == "aggregate":
                 do_action("aggregate", [], cfg, args, st, state_f)
                 continue
-            selected = pick_multi(batches, f"选择要『{action}』的批次编号（多选逗号分隔，回车取消）> ")
+            selected = pick_multi(items, f"选择要『{action}』的数据编号（多选逗号分隔，回车取消）> ")
             if not selected:
                 print("[i] 已取消")
                 continue
@@ -332,7 +371,7 @@ def main() -> int:
     if args.cmd == "list":
         return cmd_list(cfg, args, st)
     if args.cmd not in SCRIPTS:
-        print(f"[ERROR] 未知命令: {args.cmd}（可用: list / inspect / timestamps / clean / record / aggregate）")
+        print(f"[ERROR] 未知命令: {args.cmd}（可用: list / inspect / timestamps / clean / merge / convert / record / aggregate）")
         return 2
     return cmd_clean(cfg, args, state_f, st)
 

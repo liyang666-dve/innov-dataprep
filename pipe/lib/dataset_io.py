@@ -319,6 +319,26 @@ def parse_date_range(name: str) -> tuple[str, str] | None:
     return None
 
 
+def compute_episode_stats(df: pd.DataFrame, episode_index: int) -> dict[str, Any]:
+    """按真实 robodeploy v2.1 格式生成一行 episodes_stats.jsonl。
+
+    {"episode_index": n, "stats": {feature: {min, max, mean, std, count}}}
+    只统计数值特征列（跳过 KEY_COLUMNS），官方 v2.1→v3.0 转换器硬性需要此文件。
+    """
+    cols = [c for c in df.columns if c not in KEY_COLUMNS and df[c].dtype.kind in "fc"]
+    stats: dict[str, Any] = {}
+    for c in cols:
+        s = df[c]
+        cnt = int(s.count())
+        if cnt == 0:
+            continue
+        stats[c] = {
+            "min": float(s.min()), "max": float(s.max()),
+            "mean": float(s.mean()), "std": float(s.std()), "count": cnt,
+        }
+    return {"episode_index": int(episode_index), "stats": stats}
+
+
 def summarize_light(path: Path) -> dict[str, Any]:
     """轻量摘要（只读 meta + 数分集文件，不读 parquet/视频）。run.py 列表用。"""
     path = Path(path)

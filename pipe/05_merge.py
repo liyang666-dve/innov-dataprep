@@ -207,10 +207,18 @@ def merge_datasets(sources: list[Path], output: Path, dispositions: list[dict[in
             old_to_new[int(row.get("task_index", 0))] = task_name_to_idx[task]
         source_task_maps.append(old_to_new)
 
-    # episodes_stats 可选（robodeploy 有，部分 v2.1 无）
-    stats_available = all((src / "meta/episodes_stats.jsonl").is_file() for src in sources)
-    if not stats_available:
-        print("[WARN] 部分源缺 meta/episodes_stats.jsonl，输出不生成该文件（不影响合并）")
+    # episodes_stats：官方 v2.1→v3.0 转换器硬性需要；源缺时从 parquet 补算
+    source_stats = []
+    n_missing_stats = 0
+    for src in sources:
+        p = src / "meta/episodes_stats.jsonl"
+        if p.is_file():
+            source_stats.append({int(r["episode_index"]): r for r in read_jsonl(p)})
+        else:
+            source_stats.append({})
+            n_missing_stats += 1
+    if n_missing_stats:
+        print(f"[i] 有 {n_missing_stats} 个源缺 episodes_stats.jsonl，将从 parquet 补算（官方转换器需要）")
 
     merged_episodes: list[dict[str, Any]] = []
     merged_stats: list[dict[str, Any]] = []
@@ -221,9 +229,7 @@ def merge_datasets(sources: list[Path], output: Path, dispositions: list[dict[in
     for src_idx, src in enumerate(sources):
         info = dataset_io.read_meta(src)["info"]
         episodes = {int(r["episode_index"]): r for r in read_jsonl(src / "meta/episodes.jsonl")}
-        stats = {}
-        if stats_available:
-            stats = {int(r["episode_index"]): r for r in read_jsonl(src / "meta/episodes_stats.jsonl")}
+        stats = source_stats[src_idx]
         task_map = source_task_maps[src_idx]
         disp = dispositions[src_idx]
         src_chunks = int(info.get("chunks_size", chunks_size))
@@ -268,10 +274,13 @@ def merge_datasets(sources: list[Path], output: Path, dispositions: list[dict[in
             ep_row["length"] = length
             merged_episodes.append(ep_row)
 
-            if stats_available:
-                s = dict(stats[old_ep])
+            s = stats.get(old_ep)
+            if s is None:
+                s = dataset_io.compute_episode_stats(df, new_ep)
+            else:
+                s = dict(s)
                 s["episode_index"] = new_ep
-                merged_stats.append(s)
+            merged_stats.append(s)
 
             total_frames += length
             total_episodes += 1
@@ -293,8 +302,7 @@ def merge_datasets(sources: list[Path], output: Path, dispositions: list[dict[in
     write_json(output / "meta/info.json", merged_info)
     write_jsonl(output / "meta/tasks.jsonl", all_task_rows)
     write_jsonl(output / "meta/episodes.jsonl", merged_episodes)
-    if stats_available:
-        write_jsonl(output / "meta/episodes_stats.jsonl", merged_stats)
+    write_jsonl(output / "meta/episodes_stats.jsonl", merged_stats)
 
     print(f"[OK] 合并完成 -> {output}")
     print(f"[OK] 总集数 {total_episodes} / 总帧数 {total_frames} / 任务数 {len(all_task_rows)}")

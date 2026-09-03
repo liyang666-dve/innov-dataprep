@@ -26,6 +26,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from pipe.lib import dataset_io  # noqa: E402
+
 JOINT_NAMES = [f"left_{i}" for i in range(7)] + [f"right_{i}" for i in range(7)]
 
 
@@ -154,6 +156,7 @@ def main() -> int:
     artifacts_seq = ["dup_gap", "nan", "video_extra", "jump", "stuck"] if not args.clean else [""] * 5
     total_frames = 0
     ep_meta = []
+    ep_stats = []
     for ep in range(args.episodes):
         n = args.frames + (ep if args.clean else 0)  # clean 模式各集帧数一致
         n = write_episode(out, ep, n, args.fps, task_index,
@@ -164,6 +167,9 @@ def main() -> int:
             "data_path": f"data/chunk-000/episode_{ep:06d}.parquet",
             "videos_path": "videos/chunk-000",
         })
+        import pandas as pd
+        df = pd.read_parquet(out / "data" / "chunk-000" / f"episode_{ep:06d}.parquet")
+        ep_stats.append(dataset_io.compute_episode_stats(df, ep))
 
     (out / "meta" / "info.json").write_text(
         json.dumps(make_info(args.robot, args.fps, args.episodes, total_frames, cams, (w, h)),
@@ -172,6 +178,8 @@ def main() -> int:
         json.dumps({"task_index": task_index, "task": args.task}, ensure_ascii=False) + "\n", encoding="utf-8")
     (out / "meta" / "episodes.jsonl").write_text(
         "\n".join(json.dumps(e, ensure_ascii=False) for e in ep_meta) + "\n", encoding="utf-8")
+    (out / "meta" / "episodes_stats.jsonl").write_text(
+        "\n".join(json.dumps(e, ensure_ascii=False) for e in ep_stats) + "\n", encoding="utf-8")
 
     mode = "干净" if args.clean else "含脏数据(重复戳/NaN/视频错帧)"
     print(f"[OK] 假数据集已生成: {out}  ({mode})")
