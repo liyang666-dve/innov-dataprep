@@ -1,10 +1,13 @@
-# 自研部分核心依赖（01/02/登记）——按"克隆即用"最小集
+# 自研部分核心依赖（01/02/03/登记）——按"克隆即用"最小集
 numpy>=1.26
 pandas>=2.0
 pyarrow>=10.0
 PyYAML>=6.0
 
-# 可选：demo 数据生成需要（opencv 写 mp4）；视频帧数核对用系统 ffprobe，无需安装
+# 可选：视频/模糊检查（03 --blur 需要；帧数核对用系统 ffprobe，无需安装）
+# av>=12.0
 # opencv-python-headless>=4.9
-# 可选：台账 Excel 视图
+
+# 可选：台账 Excel 视图 / 开发测试
 # openpyxl>=3.1
+# pytest>=8.0

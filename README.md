@@ -5,9 +5,9 @@
 - **数据处理模块**：`pipe/`，盘点 → 时间戳审计 →（清洗 → 标注 → 合并 → 转换 → 校验 → 打包，逐步补齐）
 - **数据管理模块**：`ledger/`，每批采集/处理完生成"登记卡" → 写台账 `data_catalog.csv` → 多机台账汇总
 
-全部是命令行脚本，**克隆即用**：`git clone` → `bash setup.sh` → `cp config.example.yaml config.yaml` 改路径 → 按需跑脚本。
+全部是命令行脚本，**克隆即用**：`git clone` → `bash setup.sh` → `cp config.example.yaml config.yaml` 改路径 → `python3 run.py` 菜单式操作。
 
-> 目前实现：`01_inspect`（盘点）、`02_timestamps`（时间戳审计）、`03_clean`（清洗/质检，软标记）、`ledger/record.py`（登记卡）、`ledger/aggregate.py`（台账汇总）、`tools/make_demo_data.py`（假数据自测）。
+> 目前实现：`run.py`（总入口：菜单/短命令、扫批次、状态跟踪）、`01_inspect`（盘点）、`02_timestamps`（时间戳审计）、`03_clean`（清洗/质检，软标记）、`ledger/record.py`（登记卡）、`ledger/aggregate.py`（台账汇总）、`tools/make_demo_data.py`（假数据自测）、`tools/check_config.py`（配置体检）、`tools/self_test.sh`（一键自测）。
 > 后续：`04_annotate → 05_merge → 06_convert → 07_verify → 08_pack`（规划中）。
 
 ---
@@ -16,51 +16,70 @@
 
 | 机器 | 角色 | 跑什么 |
 |---|---|---|
-| 采集机 A | robodeploy 采集 + 批次处理 + 合并 + 转 v3.0 | `01/02/03...` + `05/06/07/08` |
+| 采集机 A | robodeploy 采集 + 批次处理 + 合并 + 转 v3.0 | `run.py`（01/02/03 + 05/06/07/08） |
 | 训练机 C | 接收交付数据直接训练 | `07_verify --delivery` |
 | 第四台电脑 | 台账汇总 | `ledger/aggregate.py` |
 | 本机 | 开发 | 仓库开发 / 假数据自测 |
 
-**数据处理顺序（已定）**：每批采完**立即轻检查**（01/02，只报告不删数据）→ 你指定的若干个批次**合并**成一个集 → 合并后统一 **标注/清洗 → 转 v3.0 → 校验 → 打包交付** 训练机。
+**数据怎么处理的（你的规则）**：想处理哪批就处理哪批、想合并哪些就合并哪些——处理顺序**每批采完立即轻检查**（01/02/03，只报告不删数据）→ **你显式指定**的若干个批次合并成一个集 → 合并后统一标注/清洗 → 转 v3.0 → 校验 → 打包交付训练机。
 
 ## 2. 快速开始
 
 ```bash
 # 采集机上（一次性）
-git clone https://github.com/liyang666-dve/innov-dataprep.git
+git clone git@github.com:liyang666-dve/innov-dataprep.git   # 公开后也可用 https 链接克隆
 cd innov-dataprep
-bash setup.sh                      # 复用 lerobot_arx_sdk311 环境；自研部分只依赖 numpy/pandas/pyarrow
-cp config.example.yaml config.yaml # 填你的路径 / 机器人映射 / 默认操作员等
+bash setup.sh                        # 自动复用 lerobot conda 环境 / 建 .venv；装依赖
+cp config.example.yaml config.yaml   # 只用改 paths 3 个路径，其他保持默认（见"配置速查表"）
+bash tools/self_test.sh              # 一键自测（推荐，防止"别台电脑行、这台不行"）
 
-# 每批采集完，立即盘点 + 时间戳审计 + 质检（都是只读、当天发现当天处理）
-python3 pipe/01_inspect.py     --input /home/arx/robodeploy/output/arx/arx_0901_1500
-python3 pipe/02_timestamps.py  --input /home/arx/robodeploy/output/arx/arx_0901_1500
-python3 pipe/03_clean.py       --input /home/arx/robodeploy/output/arx/arx_0901_1500   # 默认不查模糊帧
-python3 pipe/03_clean.py       --input /home/arx/robodeploy/output/arx/arx_0901_1500 --blur  # 加查模糊帧(较慢)
+# 日常操作：一条命令总入口（推荐，不用记长命令）
+python3 run.py                       # 菜单：列批次 → 选动作 → 选批次编号，全程点选
+python3 run.py list                  # 只看批次+状态
+python3 run.py clean 1,2             # 清洗批次 1、2（编号见 list）
+python3 run.py record 3              # 登记批次 3（数据处理达标后）
 
-# 处理/合并完成后，登记这一批
-python3 ledger/record.py --batch /home/arx/robodeploy/output/arx/arx_0901_1500 --operator 张三 --yes
-
-# 攒够一批后，第四台电脑汇总台账
-python3 ledger/aggregate.py --dir /path/to/ledgers
+# 或直接调底层脚本（精细控制时）
+python3 pipe/03_clean.py --input /home/arx/robodeploy/output/arx/arx_0901_1500 --blur
 ```
+
+**扫描范围**：`run.py` 只扫 `config.yaml → paths.batches` 目录下的**一层子目录**（不会全机器扫）；想扫别处 `python3 run.py list --path <目录>`。
+
+## 3. 配置速查表（只有这里需要你看）
+
+| 配置 | 什么意思 | 要不要改 |
+|---|---|---|
+| `paths.batches` | 你的批次数据放在哪个目录（run.py 只扫这里） | ✅ **唯一真正要改** |
+| `paths.output` | 处理输出、状态文件放哪 | 有默认，可不动 |
+| `paths.ledger` | 台账 csv 写哪 | 有默认，可不动 |
+| `robot_type_map` | 数据机型编号 → 台账机型简称 | 不填则记 `unk`，不阻塞 |
+| `defaults.*` | 登记卡预填值（采集机/操作员/版本/帧率/任务） | 登记时还能改，量力而为 |
+| `qc.*` | 03 清洗阈值 | 默认合理，日常不碰 |
+| `annotate` / `merge` | 未实现功能的占位 | 忽略 |
+
+> 判断标准：**跑不起来/扫不到数据 → 只可能是 paths.batches 写错了**；其他字段都有默认值。
 
 ## 3. 目录结构
 
 ```
 innov-dataprep/
+├── run.py                      # 总入口：交互菜单 / 短命令 / 扫批次 / 状态跟踪
 ├── pipe/                      # 数据处理模块
-│   ├── lib/dataset_io.py      # LeRobot v2.1 读写/摘要（盘点、登记共用）
+│   ├── lib/dataset_io.py      # LeRobot v2.1 识别/摘要/日期解析（盘点、登记、run.py 共用）
 │   ├── lib/video_utils.py     # ffprobe 帧数/分辨率（免 PyAV）
 │   ├── lib/report.py          # md/csv/json 报告写出
 │   ├── 01_inspect.py          # 盘点：逐集帧数/时长/帧率/时间戳/NaN/视频对齐
-│   └── 02_timestamps.py       # 时间戳审计：单调性/重复/丢帧窗口（只报告不改数据）
+│   ├── 02_timestamps.py       # 时间戳审计：单调性/重复/丢帧窗口（只报告不改数据）
+│   └── 03_clean.py            # 清洗/质检：7+ 项检查，软标记 keep/exclude（只读不删数据）
 ├── ledger/                    # 数据管理模块（登记）
-│   ├── record.py              # 登记卡 → 台账 data_catalog.csv（每批一行）
+│   ├── record.py              # 登记卡 → 台账 data_catalog.csv（默认 final 阶段：处理达标后）
 │   └── aggregate.py           # 多机台账合并汇总
-├── tools/make_demo_data.py    # 生成假 v2.1 数据集（带刻意脏数据）供自测
+├── tools/
+│   ├── make_demo_data.py      # 生成假 v2.1 数据集（带刻意脏数据）供自测
+│   ├── check_config.py        # 配置体检（YAML 解析 + 字段结构校验）
+│   └── self_test.sh           # 一键自测：假数据全链路 + 登记守卫
 ├── config.example.yaml        # 配置模板 → 拷成 config.yaml
-├── setup.sh                   # 依赖安装（conda env 探测 + pip）
+├── setup.sh                   # 依赖安装（conda env → .venv → 系统 python 兜底）
 ├── requirements.txt / pyproject.toml
 └── LICENSE (Apache-2.0)
 ```
@@ -77,9 +96,16 @@ innov-dataprep/
 └── videos/chunk-000/<cam>/episode_000000.mp4
 ```
 
-## 5. 台账字段（对应登记模板）
+## 5. 登记（时机与字段）
 
-`batch_id / task / date / total_days / robot / machine / operator / version / episodes / total_frames / fps / duration_h / avg_duration_min / sensors / format / quality / source / note / stats / registered_at`
+**登记时机（默认）**：数据处理**达标后**登记——即一批数据完成合并、转换、达标后，跑 `record.py`（或 run.py 菜单"6 登记"）对**最终数据集**生成登记卡：
+- `--stage final`（默认）：质量记 `clean`，一条台账 = 一个最终数据集；
+- `--stage raw`（可选）：对每个原始采集批次登记，质量记 `raw`（保留"每批一行"粒度，不想记就不记，不阻塞主流程）。
+
+**防呆**：非 v2.1 或空数据集 → `[ERROR] 拒绝登记`；日期解析不出 → 报错提示 `--date`；批次号重复 → 拦截。
+
+台账字段（对应登记模板）：
+`batch_id / task / date / total_days / robot / machine / operator / version / episodes / total_frames / fps / duration_h / avg_duration_min / sensors / format / quality / stage / source / stats / note / registered_at`
 
 命名公式：`{task}_{robot}_{MMDD[-MMDD]}_{N}cam_v{version}`，例：`flosser_innov_0730-0731_3cam_v2`。
 
@@ -88,19 +114,22 @@ innov-dataprep/
 ## 6. 开发/自测
 
 ```bash
+bash tools/self_test.sh              # 一键：假数据 → 01/02/03 → 登记守卫 → PASS/FAIL
+python3 tools/check_config.py        # 配置体检
 # 本机（依赖在 .pylibs，或建 venv）
 PYTHONPATH=/path/to/.pylibs python3 tools/make_demo_data.py --out demo_data/arx_demo_0901_1500
-PYTHONPATH=/path/to/.pylibs python3 pipe/01_inspect.py    --input demo_data/arx_demo_0901_1500
-PYTHONPATH=/path/to/.pylibs python3 pipe/02_timestamps.py --input demo_data/arx_demo_0901_1500
-PYTHONPATH=/path/to/.pylibs python3 ledger/record.py --batch demo_data/arx_demo_0901_1500 --operator 测试 --yes
+PYTHONPATH=/path/to/.pylibs python3 pipe/03_clean.py --input demo_data/arx_demo_0901_1500
+PYTHONPATH=/path/to/.pylibs python3 run.py list --path demo_data
 ```
 
 ## 7. Roadmap
 
+- [x] 总入口 run.py（菜单/短命令/扫批次/状态跟踪）
 - [x] 01 盘点（v2.1）
 - [x] 02 时间戳审计（只读）
 - [x] 03 清洗/质检（7+ 项检查 + 软标记，只读不删数据）
-- [x] 登记卡 + 台账 + 汇总
+- [x] 登记（默认处理达标后 final 登记）+ 台账汇总
+- [x] 工具：配置体检 check_config、一键自测 self_test、环境兜底 setup.sh
 - [ ] 04 标注（指令模板 + LLM 建议 + 写回 tasks/parquet）
 - [ ] 05 合并（官方 merge，按 03 的 episode_disposition.csv 排除坏集，指定文件清单）
 - [ ] 06 转换 v2.1→v3.0（采集机，官方 converter）

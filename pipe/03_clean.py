@@ -221,23 +221,6 @@ def blur_check(video_summary: dict, qc: dict) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------- 主流程
-def build_rows(summary: dict, qc: dict) -> list[dict]:
-    rows = []
-    for e in summary["episodes"]:
-        r = {
-            "dataset": summary["name"],
-            "episode": e["episode"],
-            "n_rows": e["n_rows"],
-            "verdict": e["_qc"]["verdict"],
-            "reasons_exclude": " | ".join(e["_qc"]["reasons_exclude"]) or "-",
-            "reasons_warn": " | ".join(e["_qc"]["reasons_warn"]) or "-",
-        }
-        for k in ("duration_s",):
-            r[k] = e["_qc"].get(k)
-        rows.append(r)
-    return rows
-
-
 def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
     meta = dataset_io.read_meta(ds)
     info = meta["info"]
@@ -246,6 +229,13 @@ def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
     eps_paths = dataset_io.discover_episodes(ds)
     do_videos = not args.no_video_check
     do_blur = qc.get("check_blur") and do_videos
+    if do_videos and video_utils.FFPROBE is None:
+        print(f"[WARN] ffprobe 不可用，{ds.name} 的视频帧数核对跳过（sudo apt install ffmpeg）")
+    if do_blur:
+        try:
+            import cv2  # noqa: F401
+        except ImportError:
+            print(f"[WARN] 未安装 opencv，{ds.name} 的模糊检查跳过（pip install opencv-python-headless）")
 
     ep_rows = []
     for p in eps_paths:
@@ -334,8 +324,9 @@ def main() -> int:
     rc = 0
     for s in args.input:
         ds = Path(s)
-        if not dataset_io.is_dataset_dir(ds):
-            print(f"[跳过] 不是 v2.1 数据集: {ds}")
+        kind, reason = dataset_io.detect_dataset(ds)
+        if kind != "v2.1":
+            print(f"[跳过] {ds.name} 不是 v2.1 数据集: {reason}")
             rc = 1
             continue
         summary = run_dataset(ds, qc, args)

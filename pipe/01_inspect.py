@@ -17,7 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from pipe.lib import dataset_io, report  # noqa: E402
+from pipe.lib import dataset_io, report, video_utils  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,13 +110,16 @@ def main() -> int:
     rc = 0
     for ds_str in args.input:
         ds = Path(ds_str)
-        if not dataset_io.is_dataset_dir(ds):
-            print(f"[跳过] 不是 v2.1 数据集: {ds}")
+        kind, reason = dataset_io.detect_dataset(ds)
+        if kind != "v2.1":
+            print(f"[跳过] {ds.name} 不是 v2.1 数据集: {reason}")
             rc = 1
             continue
         fps = args.fps if args.fps else None
         summary = dataset_io.summarize_dataset(ds, fps_nominal=fps or 30.0,
                                                check_videos=not args.no_video_check)
+        if not args.no_video_check and video_utils.FFPROBE is None:
+            print(f"[WARN] ffprobe 不可用，{ds.name} 的视频帧数核对已跳过（sudo apt install ffmpeg）")
         out_dir = Path(args.out) if args.out else ds.parent / f"{ds.name}_inspect"
         report.write_csv(out_dir / "episodes_summary.csv", build_csv_rows(summary))
         report.write_json(out_dir / "summary.json", summary)

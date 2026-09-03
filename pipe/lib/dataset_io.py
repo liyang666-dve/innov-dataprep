@@ -28,8 +28,26 @@ KEY_COLUMNS = ("episode_index", "index", "frame_index", "task_index", "timestamp
 
 
 # ---------------------------------------------------------------- 基础 IO
+def detect_dataset(path: Path) -> tuple[str, str]:
+    """识别目录类型。返回 (kind, reason)：
+    kind ∈ {v2.1, v3.0, not_dataset}。
+    - v2.1: meta/info.json + 至少 1 个 data/chunk-*/episode_*.parquet
+    - v3.0: 有 meta/info.json 但结构像 v3.0（file-*.parquet / meta/episodes/）
+    - not_dataset: 其他（带 reason）
+    """
+    path = Path(path)
+    if not (path / META_DIR / "info.json").is_file():
+        return "not_dataset", f"缺 {META_DIR}/info.json"
+    # v3.0 特征：data/chunk-*/file-*.parquet 或 meta/episodes/ 目录
+    if any((path / DATA_DIR).glob("chunk-*/file-*.parquet")) or (path / META_DIR / "episodes").is_dir():
+        return "v3.0", "疑似 v3.0 数据集（当前管道处理 v2.1，请先用 06 转换器的逆向或换环境）"
+    if not discover_episodes(path):
+        return "not_dataset", f"未发现 {DATA_DIR}/chunk-*/episode_*.parquet（空目录/数据未落盘？）"
+    return "v2.1", ""
+
+
 def is_dataset_dir(path: Path) -> bool:
-    return (path / META_DIR / "info.json").is_file()
+    return detect_dataset(path)[0] == "v2.1"
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -251,15 +269,72 @@ def _ts_to_date(ts: float | None) -> str | None:
     return datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
 
 
+def _valid_mmdd(s: str) -> bool:
+    if len(s) != 4 or not s.isdigit():
+        return False
+    m, d = int(s[:2]), int(s[2:])
+    return 1 <= m <= 12 and 1 <= d <= 31
+
+
+def _mmdd_of_yyyymmdd(s: str) -> str | None:
+    """'20260901' -> '0901'；月份/日期非法返回 None。"""
+    if len(s) != 8 or not s.isdigit():
+        return None
+    mm, dd = s[4:6], s[6:8]
+    return mm + dd if _valid_mmdd(mm + dd) else None
+
+
+_DATE_RE = re.compile(
+    r"(?P<y8a>\d{8})-(?P<y8b>\d{8})"
+    r"|(?P<y8>\d{8})"
+    r"|(?P<m4a>\d{4})-(?P<m4b>\d{4})"
+    r"|(?P<m4>\d{4})"
+)
+
+
 def parse_date_range(name: str) -> tuple[str, str] | None:
-    """从目录名解析 MMDD / MMDD-MMDD / YYYYMMDD / YYYYMMDD-YYYYMMDD。
-    返回 (start_MMDD, end_MMDD) 或 None。"""
-    m = re.search(r"(\d{4}-\d{4})", name) or re.search(r"(\d{8}-\d{8})", name)
-    if m:
-        part = m.group(1).replace("-", "")
-        a, b = part[:4], part[4:]
-        return a, b
-    m = re.search(r"(\d{4})", name)
-    if m:
-        return m.group(1), m.group(1)
+    """从目录名解析日期范围，返回 (start_MMDD, end_MMDD) 或 None。
+
+    支持：MMDD / MMDD_HHMM / MMDD-MMDD / YYYYMMDD / YYYYMMDD-YYYYMMDD。
+    规则：MMDD 必须月份 01-12、日期 01-31 才认账；解析不出/歧义返回 None，
+    由调用方决定报错（绝不生成 0101 这类假日期）。
+    """
+    for m in _DATE_RE.finditer(name):
+        if m.group("y8a"):
+            a, b = _mmdd_of_yyyymmdd(m.group("y8a")), _mmdd_of_yyyymmdd(m.group("y8b"))
+            if a and b:
+                return a, b
+        if m.group("y8"):
+            a = _mmdd_of_yyyymmdd(m.group("y8"))
+            if a:
+                return a, a
+        if m.group("m4a"):
+            a, b = m.group("m4a"), m.group("m4b")
+            if _valid_mmdd(a) and _valid_mmdd(b):
+                return a, b
+        if m.group("m4"):
+            a = m.group("m4")
+            if _valid_mmdd(a):
+                return a, a
     return None
+
+
+def summarize_light(path: Path) -> dict[str, Any]:
+    """轻量摘要（只读 meta + 数分集文件，不读 parquet/视频）。run.py 列表用。"""
+    path = Path(path)
+    kind, reason = detect_dataset(path)
+    if kind != "v2.1":
+        return {"path": str(path), "name": path.name, "kind": kind, "reason": reason}
+    meta = read_meta(path)
+    info = meta["info"]
+    n_eps = len(discover_episodes(path))
+    return {
+        "path": str(path),
+        "name": path.name,
+        "kind": "v2.1",
+        "reason": "",
+        "robot_type": str(info.get("robot_type") or "unk"),
+        "fps": float(info.get("fps") or 0.0),
+        "n_episodes": n_eps,
+        "tasks": [t.get("task") for t in meta["tasks"]],
+    }

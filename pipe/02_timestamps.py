@@ -131,8 +131,9 @@ def main() -> int:
     rc = 0
     for ds_str in args.input:
         ds = Path(ds_str)
-        if not dataset_io.is_dataset_dir(ds):
-            print(f"[跳过] 不是 v2.1 数据集: {ds}")
+        kind, reason = dataset_io.detect_dataset(ds)
+        if kind != "v2.1":
+            print(f"[跳过] {ds.name} 不是 v2.1 数据集: {reason}")
             rc = 1
             continue
         out = Path(args.out) if args.out else ds.parent / f"{ds.name}_timestamps"
