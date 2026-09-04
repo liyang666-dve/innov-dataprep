@@ -8,6 +8,9 @@ PyYAML>=6.0
 # av>=12.0
 # opencv-python-headless>=4.9
 
+# 可选：Rerun 回放（Web 回放页 / 一键动作→回放 需要；VLM 标注只用标准库，无需新增依赖）
+# rerun-sdk>=0.19
+
 # 可选：台账 Excel 视图 / 开发测试
 # openpyxl>=3.1
 # pytest>=8.0

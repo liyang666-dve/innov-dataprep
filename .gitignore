@@ -2,6 +2,9 @@
 config.yaml
 *.local.yaml
 
+# 工具/对话记录（IDE 辅助目录，不入库）
+.trae/
+
 # 数据与输出：绝不入库
 raw/
 out/

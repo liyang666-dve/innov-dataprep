@@ -40,7 +40,7 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 [ -n "$PYTHON_BIN" ] || { echo "[ERROR] 未找到 python3，请先安装 Python 3.10+"; exit 1; }
 
-echo "==> 2/4 安装/校验依赖（core + 视频/模糊用，不加 --upgrade）..."
+echo "==> 2/4 安装/校验依赖（core + 视频/模糊/Rerun 回放用，不加 --upgrade）..."
 pip_install() {
   "$PYTHON_BIN" -m pip install --quiet "$@" 2>/tmp/innov_pip_err.txt
   local rc=$?
@@ -55,8 +55,8 @@ if ! pip_install numpy pandas pyarrow PyYAML; then
   echo "[ERROR] 核心依赖安装失败（见上方输出）。conda 用户请检查网络；venv 用户请确认 pip 可用。"
   exit 1
 fi
-if ! pip_install opencv-python-headless av; then
-  echo "    ⚠ 可选依赖（opencv/av）安装失败，模糊检查/视频解码不可用，其余功能不受影响。"
+if ! pip_install opencv-python-headless av rerun-sdk; then
+  echo "    ⚠ 可选依赖（opencv/av/rerun-sdk）安装失败，模糊检查/视频解码/Rerun 回放不可用，其余功能不受影响。"
 fi
 
 echo "==> 3/4 检查 ffprobe（视频帧数核对用，缺少则该项明确提示、自动跳过）..."
