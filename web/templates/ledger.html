@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}台账 · innov-dataprep{% endblock %}
+{% block content %}
+<h1>台账（data_catalog.csv）</h1>
+<div class="card">
+  <div class="toolbar">
+    <button class="sec" onclick="agg()">汇总台账(aggregate)</button>
+    <span id="meta" class="muted"></span>
+  </div>
+  <div id="msg" class="hint" style="display:none"></div>
+  <div id="tbl"></div>
+</div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script>
+let COLS = [], ROWS = [];
+async function load(){
+  const d = await jget("/api/ledger");
+  COLS = d.cols||[]; ROWS = d.rows||[];
+  document.getElementById("meta").textContent = `${d.path} · 共 ${ROWS.length} 行`;
+  const box = document.getElementById("tbl"); clear(box);
+  if (!COLS.length){ const m=el("div","muted","台账文件不存在或为空。可在“一键动作”页对达标数据执行登记后再回来。"); box.appendChild(m); return; }
+  const t = el("table");
+  t.innerHTML = "<thead><tr>" + COLS.map(c=>`<th>${c}</th>`).join("") + "</tr></thead>";
+  const tb = el("tbody");
+  for (const r of ROWS){ const tr=el("tr"); tr.innerHTML = COLS.map(c=>`<td>${r[c]??''}</td>`).join(""); tb.appendChild(tr); }
+  t.appendChild(tb); box.appendChild(t);
+}
+async function agg(){
+  const msg = document.getElementById("msg"); msg.style.display="block"; msg.textContent="汇总中…";
+  const ov = await jget("/overview");
+  // aggregate 由 CLI 触发；这里直接调 ledger/aggregate.py 不方便经浏览器跑
+  msg.textContent = "汇总请在终端执行：python3 run.py aggregate（本页为台账只读展示）。";
+  load();
+}
+load();
+</script>
+{% endblock %}

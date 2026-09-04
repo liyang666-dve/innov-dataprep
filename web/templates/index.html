@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}批次总览 · innov-dataprep{% endblock %}
+{% block content %}
+<h1>批次总览</h1>
+<div class="card">
+  <div class="toolbar">
+    <button class="sec" onclick="load()">刷新</button>
+    <span class="muted">点击行进入详情；在“一键动作”页自由选择批次与顺序。</span>
+  </div>
+  <div id="wrap"></div>
+</div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script>
+let ROWS = [];
+async function load() {
+  const data = await jget("/api/overview");
+  ROWS = data.rows || [];
+  const wrap = document.getElementById("wrap");
+  clear(wrap);
+  for (const g of data.groups || []) {
+    const rows = ROWS.filter(r => r.group === g);
+    if (!rows.length) continue;
+    const h = el("h2", null, g === "采集" ? "◆ 采集批次" : "◆ 已处理输出");
+    wrap.appendChild(h);
+    const t = el("table");
+    t.innerHTML = `<thead><tr>
+      <th>名称</th><th>版本</th><th>集数</th><th>fps</th><th>机型</th><th>已跑步骤</th><th>路径</th></tr></thead>`;
+    const tb = el("tbody");
+    for (const r of rows) {
+      const tr = el("tr", "row-link");
+      tr.onclick = () => location = `/batch?path=${encodeURIComponent(r.path)}`;
+      const reason = (r.kind === 'not_dataset') ? `<span class="muted">(${r.reason||''})</span>` : '';
+      tr.innerHTML = `<td><span class="tag">#${r.idx}</span> ${r.name} ${reason}</td>
+        <td>${kindChip(r.kind)}</td>
+        <td class="num">${r.n_episodes ?? '-'}</td>
+        <td class="num">${r.fps ?? '-'}</td>
+        <td>${r.robot_type ?? '-'}</td>
+        <td>${doneBadges(r.done)}</td>
+        <td class="muted">${r.path}</td>`;
+      tb.appendChild(tr);
+    }
+    t.appendChild(tb);
+    wrap.appendChild(t);
+  }
+  if (!ROWS.length) wrap.appendChild(el("div","muted","没有可列出的数据。配置 config.yaml 的 paths.batches，或去“一键动作”页填路径。"));
+}
+load();
+</script>
+{% endblock %}

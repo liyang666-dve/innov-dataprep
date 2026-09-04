@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}交付 rsync · innov-dataprep{% endblock %}
+{% block content %}
+<h1>交付 rsync（发送到训练机）</h1>
+<div class="grid three">
+  <div class="card col">
+    <h2>① 源数据集 <button class="sec" style="float:right" onclick="load()">刷新</button></h2>
+    <div class="toolbar">
+      <input id="manual_source" type="text" placeholder="/绝对/路径(可手动填)" style="flex:1">
+      <button class="sec" onclick="setManualSource()">填入</button>
+    </div>
+    <div id="sources" class="picklist"></div>
+    <div id="cur_src" class="muted" style="margin-top:8px">（尚未选择源）</div>
+    <div id="src_reason" class="hint" style="margin-top:4px"></div>
+  </div>
+
+  <div class="card col">
+    <h2>② 目标（每次手填，不入 config）</h2>
+    <div class="form-row"><label>主机 host</label><input id="host" type="text" placeholder="192.168.1.10"></div>
+    <div class="form-row"><label>用户名 user</label><input id="user" type="text" placeholder="ubuntu"></div>
+    <div class="form-row"><label>目录 dir</label><input id="dir" type="text" placeholder="/home/ubuntu/data (绝对路径)"></div>
+    <div class="form-row"><label>id_rsa(可选)</label><input id="identity" type="text" placeholder="/home/arx/.ssh/id_rsa 或留空"></div>
+    <button onclick="preview()" style="width:100%">① 预览 dry-run</button>
+    <button id="goBtn" onclick="run()" class="danger" style="width:100%;margin-top:6px" disabled>② 开始传输</button>
+    <div id="preview" class="hint" style="margin-top:10px;white-space:pre-wrap">填写目标后点“预览 dry-run”，确认清单再传输。</div>
+  </div>
+
+  <div class="card col result">
+    <h2>③ 传输日志</h2>
+    <div id="result" class="hint" style="white-space:pre-wrap">（尚未传输）</div>
+    <pre id="log" class="log">传输日志会实时显示在这里。</pre>
+  </div>
+</div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script>
+let SELECTED = "";
+
+function levelChip(row) {
+  const { level, reason, deliver_count } = row;
+  const lv = { ok:["ok","可交付"], warn:["warn","未清洗"], block:["block","不可交付"] }[level] || ["block", level];
+  const times = deliver_count ? `<span class="chip ok" title="${row.last_deliver||''}">已交付×${deliver_count}</span>` : "";
+  return `<span class="chip ${lv[0]}" title="${reason.replace(/"/g,'&quot;')}">${lv[1]}</span>${times}`;
+}
+
+async function load() {
+  const d = await jget("/api/deliver");
+  const box = document.getElementById("sources"); clear(box);
+  const tbl = el("table");
+  tbl.innerHTML = "<thead><tr><th></th><th>名称</th><th>版本</th><th>已完成步</th><th>可交付性</th></tr></thead>";
+  const tb = el("tbody");
+  for (const r of d.rows || []) {
+    const dis = r.level === "block";
+    const row = el("tr", dis ? "muted" : "");
+    row.innerHTML = `<td><input type="radio" name="src" data-path="${r.path}" ${dis?"disabled":""}></td>
+      <td title="${r.path}">${r.name}</td>
+      <td>${kindChip(r.kind)}</td>
+      <td>${doneBadges(r.done)}</td>
+      <td>${levelChip(r)}</td>`;
+    row.querySelector("input").onchange = () => pick(r);
+    tb.appendChild(row);
+  }
+  tbl.appendChild(tb); box.appendChild(tbl);
+  refreshCur();
+}
+
+function pick(r) {
+  SELECTED = r.path;
+  const reasonBox = document.getElementById("src_reason");
+  reasonBox.textContent = r.reason || "";
+  reasonBox.className = r.level === "warn" ? "hint warn" : "hint";
+  refreshCur();
+}
+function setManualSource() {
+  const v = document.getElementById("manual_source").value.trim();
+  if (!v) return;
+  SELECTED = v;
+  document.getElementById("manual_source").value = "";
+  document.getElementById("src_reason").textContent = "";
+  refreshCur();
+}
+function refreshCur() {
+  document.getElementById("cur_src").textContent = "当前源：" + (SELECTED || "(未选择)");
+  const inputs = document.querySelectorAll('input[name="src"]');
+  inputs.forEach(i => { if (i.dataset.path === SELECTED) { i.checked = true; } });
+  setGoDisabled();
+}
+function target() {
+  return { source: SELECTED, host: document.getElementById("host").value,
+           user: document.getElementById("user").value, dir: document.getElementById("dir").value,
+           identity: document.getElementById("identity").value };
+}
+function setGoDisabled() {
+  document.getElementById("goBtn").disabled = !(SELECTED &&
+    document.getElementById("host").value && document.getElementById("dir").value);
+}
+async function preview() {
+  const box = document.getElementById("preview");
+  if (!SELECTED) { box.textContent = "请先选择源数据集"; return; }
+  box.textContent = "预览中…";
+  const r = await jget("/api/deliver/preview", { method:"POST", headers:{"Content-Type":"application/json"},
+                       body: JSON.stringify(target()) });
+  if (r.ok) box.textContent = `将传输 ${r.files ?? '?'} 个文件，约 ${r.size ?? '?'} → ${r.dirname}/`;
+  else box.textContent = "预览失败：" + (r.error ? (Array.isArray(r.error)?r.error[0]:r.error) : "请检查目标连通性");
+  if (r.ok) document.getElementById("goBtn").disabled = false;
+}
+async function run() {
+  const btn = document.getElementById("goBtn"); btn.disabled = true;
+  setResult("传输中…", "");
+  const logEl = document.getElementById("log"); logEl.textContent = "";
+  jget("/api/deliver", { method:"POST", headers:{"Content-Type":"application/json"},
+                         body: JSON.stringify(target()) })
+    .then(res => {
+      if (res.error) { logEl.textContent = res.error; setResult("提交失败：" + res.error, "fail"); btn.disabled=false; return; }
+      subscribe(logEl, res.task_id, async d => {
+        setResult(d.rc === 0 ? "✔ 交付完成" : "✘ 交付失败（见日志）", d.rc === 0 ? "ok" : "fail");
+        if (d.rc === 0) load(); // 传输成功后刷新列表，重新识别并标记“已交付×n”
+      });
+    });
+}
+function setResult(text, cls) {
+  const box = document.getElementById("result");
+  box.textContent = text; box.className = "banner" + (cls ? " " + cls : "");
+}
+["host","dir"].forEach(id => document.getElementById(id).addEventListener("input", setGoDisabled));
+load();
+</script>
+{% endblock %}

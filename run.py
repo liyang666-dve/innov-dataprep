@@ -29,9 +29,10 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from pipe.lib import dataset_io  # noqa: E402
+from pipe.lib import suggest as _suggest  # noqa: E402  # 仅用于 annotate 的无端点拦截
 
-STEPS = ["inspect", "timestamps", "clean", "merge", "convert", "record"]  # 已实现
-PENDING = ["verify", "pack"]                                              # 规划中（07-08）
+STEPS = ["inspect", "timestamps", "clean", "merge", "convert", "record", "annotate"]  # 已实现
+PENDING = ["verify", "pack"]                                                          # 规划中（07-08）
 
 ACTION_MENU = [
     ("inspect", "盘点(01) 每集统计/视频对齐"),
@@ -40,6 +41,7 @@ ACTION_MENU = [
     ("merge", "合并(05) 勾选若干批次按坏集排除并成一份"),
     ("convert", "转换(06) v2.1→v3.0 官方转换器(自动留 v2.1 备份)"),
     ("record", "登记 处理达标后入台账"),
+    ("annotate", "标注(09) VLM 逐集质量评分+建议"),
     ("aggregate", "汇总台账"),
     ("quit", "退出"),
 ]
@@ -52,6 +54,7 @@ SCRIPTS = {
     "convert": "pipe/06_convert.py",
     "record": "ledger/record.py",
     "aggregate": "ledger/aggregate.py",
+    "annotate": "pipe/09_annotate.py",
 }
 
 
@@ -98,7 +101,7 @@ def scan_roots(cfg: dict, path_override: str | None) -> list[dict]:
     if not path_override:
         out_root = Path(cfg.get("paths", {}).get("output") or "").expanduser()
         if out_root.is_dir() and out_root.resolve() != root.resolve():
-            outs = [i for i in scan_batches(out_root) if i["kind"] == "v2.1"]
+            outs = [i for i in scan_batches(out_root) if i["kind"] in ("v2.1", "v3.0")]
             for i in outs:
                 i["group"] = "输出"
             items = items + outs
@@ -106,8 +109,37 @@ def scan_roots(cfg: dict, path_override: str | None) -> list[dict]:
 
 
 def state_path(cfg: dict, override: str | None) -> Path:
-    p = override or cfg.get("paths", {}).get("output")
-    return Path(p).expanduser() if p else (ROOT / ".dataprep_state.json")
+    # --state 优先：视为确切的状态文件路径
+    if override:
+        return Path(override).expanduser()
+    # 否则状态文件放 paths.output 目录内，避免把输出目录本身占成文件
+    out = cfg.get("paths", {}).get("output")
+    if out:
+        base = Path(out).expanduser()
+        # 兼容旧版误把 output 路径写成状态文件的情况：还原为目录 + 内部状态文件
+        if base.is_file():
+            _migrate_state_from_file(base)
+        return base / ".dataprep_state.json"
+    return ROOT / ".dataprep_state.json"
+
+
+def _migrate_state_from_file(base: Path) -> None:
+    """旧版本曾把 paths.output 路径直接当作状态文件占用，还原成目录并迁移状态。"""
+    try:
+        data = base.read_bytes()
+        content = data.decode("utf-8")
+    except Exception:  # noqa: BLE001
+        content = "{}"
+    try:
+        base.unlink()          # 删掉占用的文件
+        if not base.is_dir():  # 建立同名目录（run.py 之前不会真的建目录）
+            one = base.parent / "__mk_placeholder__"
+            one.mkdir(parents=True, exist_ok=True)
+            one.rename(base)
+        (base / ".dataprep_state.json").write_text(content, encoding="utf-8")
+        print(f"[i] 已将原 output 路径从文件还原为目录，状态迁移至 {base / '.dataprep_state.json'}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[WARN] 迁移 output 路径失败（{e}），状态将写入默认位置")
 
 
 def load_state(p: Path) -> dict:
@@ -131,14 +163,15 @@ def mark(st: dict, path: str, step: str) -> None:
 # ---------------------------------------------------------------- 展示
 def fmt_row(idx: int, info: dict, st: dict) -> str:
     key = info["path"]
-    if info["kind"] != "v2.1":
-        return f"  [{idx}] {info['name']:<34} — 不可用: {info['reason']}"
     s = st.get(key, {})
-    status = "  ".join(f"{n}✓" for n in ("inspect", "timestamps", "clean", "merge", "record") if s.get(n))
+    status = "  ".join(f"{n}✓" for n in ("inspect", "timestamps", "clean", "merge", "convert", "record") if s.get(n))
+    if info["kind"] == "not_dataset":
+        return f"  [{idx}] {info['name']:<34} — 不可用: {info['reason']}"
+    tag = {"v2.1": "v2.1", "v3.0": "v3.0"}.get(info["kind"], info["kind"])
     info_l = ""
     if info.get("n_episodes") is not None:
         info_l = f"{info['n_episodes']}集 {info['fps']:g}fps {info['robot_type']}"
-    return f"  [{idx}] {info['name']:<34} {info_l:<18} {status or '未处理'}"
+    return f"  [{idx}] {info['name']:<32} {tag:<5} {info_l:<18} {status or '未处理'}"
 
 
 def show_batches(batches: list[dict], st: dict) -> None:
@@ -148,17 +181,108 @@ def show_batches(batches: list[dict], st: dict) -> None:
         g = info.get("group", "批次")
         if g != cur:
             cur = g
-            label = "采集批次（paths.batches）" if g == "批次" else "已处理输出（paths.output，v2.1）"
+            label = "采集批次（paths.batches）" if g == "批次" else "已处理输出（paths.output）"
             print(f"◆ {label}")
         print(fmt_row(i, info, st))
     print("-" * 70)
 
 
 # ---------------------------------------------------------------- 执行
-def run_script(script: str, argv: list[str]) -> int:
-    print(f"\n==> python3 {script} {' '.join(argv)}", flush=True)
-    r = subprocess.run([sys.executable, script, *argv], cwd=str(ROOT))
+def run_script(script: str, argv: list[str], out_stream=None) -> int:
+    cmd = [sys.executable, script, *argv]
+    header = f"==> python3 {script} {' '.join(argv)}"
+    if out_stream is not None:  # Web 场景：逐行推给 SSE
+        out_stream(header)
+        return _run_streamed(cmd, out_stream)
+    print(header, flush=True)
+    r = subprocess.run(cmd, cwd=str(ROOT))
     return r.returncode
+
+
+def _run_streamed(cmd: list[str], out_stream) -> int:
+    p = subprocess.Popen(cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+    if p.stdout:
+        for line in p.stdout:
+            out_stream(line.rstrip("\n"))
+    p.wait()
+    out_stream("[exit]")
+    return p.returncode
+
+
+def build_action_argv(action: str, allowed: list[dict], cfg: dict, opts: dict | None) -> list[str]:
+    """把"动作 + 选中批次"组装成子进程 argv，供 CLI 与 Web 共用，不带任何 input()。"""
+    opts = opts or {}
+    if action == "merge":
+        argv = ["--inputs", *[i["path"] for i in allowed]]
+        name = opts.get("out_name")
+        if name:
+            out_root = cfg.get("paths", {}).get("output") or "."
+            argv += ["--output", str(Path(out_root).expanduser() / name)]
+        if (ROOT / "config.yaml").is_file():
+            argv += ["--config", str(ROOT / "config.yaml")]
+        return argv
+    if action == "convert":
+        argv = ["--input", allowed[0]["path"]]
+        if opts.get("yes"):
+            argv += ["--yes"]
+        return argv
+    if action == "record":
+        argv = ["--batch", allowed[0]["path"], "--stage", opts.get("stage") or "final"]
+        if opts.get("yes"):
+            argv += ["--yes"]
+        if (ROOT / "config.yaml").is_file():
+            argv += ["--config", str(ROOT / "config.yaml")]
+        return argv
+    if action == "annotate":
+        argv = []
+        for info in allowed:
+            argv += ["--input", info["path"]]
+        if (ROOT / "config.yaml").is_file():
+            argv += ["--config", str(ROOT / "config.yaml")]
+        return argv
+    # inspect / timestamps / clean
+    argv = []
+    for info in allowed:
+        argv += ["--input", info["path"]]
+    return argv
+
+
+def execute_action(action: str, allowed: list[dict], cfg: dict, st: dict,
+                   state_f: Path, opts: dict | None = None, out_stream=None) -> int:
+    """非交互执行链：前置校验 → 组 argv → 跑子进程 → 成功后标记/留痕。
+
+    CLI 与 Web 共用；Web 传 out_stream 逐行为 SSE，CLI 传 None 打印到 stdout。
+    """
+    opts = opts or {}
+    say = out_stream or (lambda s: print(s))
+    allowed, _blocked = split_allowed(action, allowed, say)  # 前置校验提示走 say(SSE)
+    if not allowed:
+        say("[!] 所选批次均不满足该动作的前置条件，未执行任何操作")
+        return 1
+    if action == "merge" and len(allowed) < 2:
+        say("[!] 合并至少需要 2 个可合并的 v2.1 批次")
+        return 1
+    if action == "convert" and len(allowed) != 1:
+        say("[!] 转换一次只处理一个 v2.1 数据集")
+        return 1
+    if action == "record" and len(allowed) != 1:
+        say("[!] 登记一次只处理一个批次，请重新选择")
+        return 1
+    if action == "annotate":
+        _ac = _suggest.annotate_config(cfg)
+        if not _ac["ok"]:
+            say(f"[!] 标注被拦截：{_ac['reason']}")
+            return 1
+    argv = build_action_argv(action, allowed, cfg, opts)
+    rc = run_script(SCRIPTS[action], argv, out_stream=say)
+    if rc == 0:
+        for info in allowed:
+            mark(st, info["path"], action)
+            note = opts.get("stage") or "" if action == "record" else ""
+            record_op(state_f, info, action, note=note)
+        save_state(state_f, st)
+    return rc
 
 
 def pick_multi(batches: list[dict], prompt: str) -> list[dict]:
@@ -181,6 +305,60 @@ def pick_multi(batches: list[dict], prompt: str) -> list[dict]:
         return [batches[i - 1] for i in dict.fromkeys(idxs)]
 
 
+# ---------------------------------------------------------------- 前置校验
+def action_kind_hint(action: str, info: dict) -> str | None:
+    """返回该批次执行该动作被挡住的原因；None=允许。自由编排：任意批次都可选中，
+    但版本不满足的动作给出明确提示，不静默跳过、也不用 0 集误导。"""
+    kind = info.get("kind")
+    if action in ("inspect", "timestamps", "clean", "record", "annotate"):
+        return None if kind in ("v2.1", "v3.0") else "该步骤需要 v2.1/v3.0 数据集（exclude 软标记，不删源）"
+    if action == "convert":
+        if kind == "v3.0":
+            return "已是 v3.0，无需转换（可直接校验/登记）"
+        return None if kind == "v2.1" else "转换只针对 v2.1 数据集"
+    if action == "merge":
+        return None if kind == "v2.1" else "合并源需 v2.1"
+    return None
+
+
+def ops_file(state_f: Path) -> Path:
+    return state_f.parent / ".dataprep_ops.jsonl"
+
+
+def record_op(state_f: Path, info: dict, action: str, note: str = "") -> None:
+    """操作留痕：每次动作追加一行到 .dataprep_ops.jsonl，可在 UI/命令行回看每批处理链。"""
+    try:
+        p = ops_file(state_f)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "action": action,
+                "name": info.get("name"),
+                "path": info.get("path"),
+                "kind": info.get("kind"),
+                "note": note,
+            }, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def split_allowed(action: str, selected: list[dict], say=None) -> tuple[list[dict], list[tuple[dict, str]]]:
+    """把选中批次分成 (可执行, 被挡<批次,原因>)。被挡的会打印提示但不会执行。
+    say=callable 时用它输出（Web 走 SSE），否则 print 到 stdout。"""
+    say = say or (lambda s: print(s))
+    allowed: list[dict] = []
+    blocked: list[tuple[dict, str]] = []
+    for info in selected:
+        hint = action_kind_hint(action, info)
+        if hint:
+            say(f"[i] {info['name']} 跳过: {hint}")
+            blocked.append((info, hint))
+        else:
+            allowed.append(info)
+    return allowed, blocked
+
+
 def do_action(action: str, selected: list[dict], cfg: dict, args: argparse.Namespace,
               st: dict, state_f: Path) -> int:
     if action in PENDING:
@@ -191,82 +369,34 @@ def do_action(action: str, selected: list[dict], cfg: dict, args: argparse.Names
         d = args.aggregate_dir or str(ledger.parent)
         print(f"汇总目录: {d}（找 data_catalog*.csv）")
         return run_script(SCRIPTS["aggregate"], ["--dir", d])
+
+    # CLI：用 input() 收集本动作的可选参数，其余走共用的 execute_action
+    opts: dict = {}
     if action == "merge":
-        v21 = [i for i in selected if i["kind"] == "v2.1"]
-        if len(v21) < 2:
-            print(f"[!] 合并至少需要 2 个 v2.1 批次（想合并哪些就勾哪些，至少 2 个）")
-            return 1
-        argv = ["--inputs", *[i["path"] for i in v21]]
         if args.output:
-            argv += ["--output", args.output]
+            opts["out_name"] = args.output
         elif sys.stdin.isatty():
             out_root = cfg.get("paths", {}).get("output")
             if out_root:
-                name = input("输出目录名（回车自动生成）> ").strip()
+                try:
+                    name = input("输出目录名（回车自动生成）> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    name = ""
                 if name:
-                    argv += ["--output", str(Path(out_root) / name)]
-        if (ROOT / "config.yaml").is_file():
-            argv += ["--config", str(ROOT / "config.yaml")]
-        rc = run_script(SCRIPTS["merge"], argv)
-        if rc == 0:
-            for info in v21:
-                mark(st, info["path"], "merge")
-            save_state(state_f, st)
-        return rc
-    if action == "convert":
-        v21 = [i for i in selected if i["kind"] == "v2.1"]
-        if len(v21) != 1:
-            print("[!] 转换一次只处理一个 v2.1 数据集（通常是列表『输出』组的合并产物）")
-            return 1
-        info = v21[0]
-        argv = ["--input", info["path"]]
+                    opts["out_name"] = name
+    elif action == "convert":
         if not sys.stdin.isatty():  # 非交互场景自动确认
-            argv += ["--yes"]
-        rc = run_script(SCRIPTS["convert"], argv)
-        if rc == 0:
-            mark(st, info["path"], "convert")
-            save_state(state_f, st)
-        return rc
-    if action == "record":
-        if len(selected) != 1:
-            print("[!] 登记一次只处理一个批次，请重新选择")
-            return 1
-        info = selected[0]
-        if info["kind"] != "v2.1":
-            print(f"[!] {info['name']} 不是 v2.1 数据集，无法登记")
-            return 1
+            opts["yes"] = True
+    elif action == "record":
         stage = args.stage
-        if not stage:
+        if not stage and sys.stdin.isatty():
             try:
                 ans = input("登记阶段?  1) final(处理后,默认)  2) raw(原始批次)  [回车=final] ").strip()
             except (EOFError, KeyboardInterrupt):
                 ans = ""
             stage = "raw" if ans == "2" else "final"
-        argv = ["--batch", info["path"], "--stage", stage]
-        if (ROOT / "config.yaml").is_file():
-            argv += ["--config", str(ROOT / "config.yaml")]
-        rc = run_script(SCRIPTS["record"], argv)
-        if rc == 0:
-            mark(st, info["path"], "record")
-            save_state(state_f, st)
-        return rc
-    # inspect / timestamps / clean
-    argv = []
-    for info in selected:
-        if info["kind"] != "v2.1":
-            print(f"[!] 跳过 {info['name']}: {info['reason']}")
-            continue
-        argv += ["--input", info["path"]]
-    if not argv:
-        print("[!] 没有可处理的 v2.1 批次")
-        return 1
-    rc = run_script(SCRIPTS[action], argv)
-    if rc == 0:
-        for info in selected:
-            if info["kind"] == "v2.1":
-                mark(st, info["path"], action)
-        save_state(state_f, st)
-    return rc
+        opts["stage"] = stage or "final"
+    return execute_action(action, selected, cfg, st, state_f, opts)
 
 
 # ---------------------------------------------------------------- 命令入口

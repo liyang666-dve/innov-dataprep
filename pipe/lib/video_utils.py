@@ -25,6 +25,26 @@ def _run(args: list[str], timeout: int = _TIMEOUT) -> str:
         return ""
 
 
+def frame_pts(path: Path) -> list[float]:
+    """读取视频全部帧的 pts_time（秒）。v3.0 按时间窗切分单集视频帧用。
+    返回空列表表示无法读取（无 ffprobe / 文件异常）。"""
+    if not FFPROBE or not Path(path).is_file():
+        return []
+    out = _run(["-select_streams", "v:0", "-show_frames", "-show_entries", "frame=pts_time", str(path)],
+               timeout=600)
+    if not out:
+        return []
+    pts: list[float] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                pts.append(float(line))
+            except ValueError:  # noqa: PERF203
+                continue
+    return pts
+
+
 def count_frames(path: Path) -> int | None:
     """mp4 视频帧数。返回 None 表示无法读取（无 ffprobe / 文件异常）。"""
     if not FFPROBE or not Path(path).is_file():

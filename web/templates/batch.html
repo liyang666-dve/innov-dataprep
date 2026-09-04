@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}批次详情 · innov-dataprep{% endblock %}
+{% block content %}
+<h1><span id="name">批次详情</span></h1>
+<div id="wrap"></div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script>
+const PATH = decodeURIComponent("{{ path|safe }}");
+async function load() {
+  const d = await jget("/api/batch?path=" + encodeURIComponent(PATH));
+  const wrap = document.getElementById("wrap");
+  clear(wrap);
+  document.getElementById("name").textContent = d.name + " " + kindChip(d.kind);
+
+  if (d.kind === "not_dataset") {
+    wrap.appendChild(el("div", "hint", "该目录不是可处理的数据集：\n" + (d.reason || "")));
+    return;
+  }
+  // 元数据
+  const card = el("div","card");
+  const g = el("div","grid");
+  const lg = d.light || {};
+  const kv = [["路径", d.path],["版本", d.kind],["集数", lg.n_episodes],["标称fps", lg.fps],
+              ["机型", lg.robot_type],["帧数", lg.n_frames],["时长(h)", lg.duration_h],
+              ["任务", (lg.task_names || []).join(", ") || "-"]];
+  for (const [k,v] of kv) {
+    const b = el("div","kv"); b.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div>`; g.appendChild(b);
+  }
+  card.appendChild(g);
+
+  // 操作链时间线
+  const t2 = el("h2", null, "处理链（操作留痕）");
+  card.appendChild(t2);
+  const tl = el("div","timeline");
+  if (!d.ops || !d.ops.length) tl.appendChild(el("div","muted","暂无操作记录"));
+  else for (const o of d.ops.slice().reverse()) {
+    const it = el("div","item");
+    it.innerHTML = `<span class="t">${o.time||''}</span><b>${o.action}</b>${o.note?` · <span class="muted">${o.note}</span>`:''}`;
+    tl.appendChild(it);
+  }
+  card.appendChild(tl);
+  wrap.appendChild(card);
+
+  // 质检明细
+  const art = d.artifacts || {};
+  if (art.summary_json) {
+    const s = el("div","card");
+    s.innerHTML = `<h2>清洗汇总</h2>
+      <div class="muted">共 ${art.summary_json.n_episodes} 集 · keep ${art.summary_json.n_keep} · exclude ${art.summary_json.n_exclude}</div>`;
+    wrap.appendChild(s);
+  }
+  if (art.disposition && art.disposition.length) {
+    const c = el("div","card");
+    c.appendChild(el("h2", null, "质检明细（episode_disposition.csv）"));
+    const t = el("table");
+    t.innerHTML = `<thead><tr><th>episode</th><th>verdict</th><th>时长(s)</th><th>排除原因</th><th>警告</th><th>行数</th></tr></thead>`;
+    const tb = el("tbody");
+    for (const r of art.disposition) {
+      const tr = el("tr");
+      const v = r.verdict;
+      tr.innerHTML = `<td class="num">${r.episode}</td>
+        <td class="verdict ${v==='exclude'?'v-exclude':'v-keep'}">${v}</td>
+        <td class="num">${r.duration_s}</td>
+        <td>${r.reasons_exclude !== '-' ? r.reasons_exclude : '-'}</td>
+        <td>${r.reasons_warn !== '-' ? r.reasons_warn : '-'}</td>
+        <td class="num">${r.n_rows}</td>`;
+      tb.appendChild(tr);
+    }
+    t.appendChild(tb);
+    c.appendChild(t);
+    wrap.appendChild(c);
+  }
+}
+load();
+</script>
+{% endblock %}

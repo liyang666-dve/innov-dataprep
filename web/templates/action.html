@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% block title %}一键动作 · innov-dataprep{% endblock %}
+{% block content %}
+<h1>一键动作（任意批次 × 任意动作 × 任意顺序）</h1>
+<div class="grid three">
+  <div class="card col">
+    <h2>① 数据清单</h2>
+    <div class="toolbar">
+      <input id="manual_path" type="text" placeholder="/绝对/路径" style="flex:1">
+      <button class="sec" onclick="addManual()">加入</button>
+    </div>
+    <div id="select" class="picklist"></div>
+    <div id="extra" class="muted" style="margin-top:8px">（执行后此清单自动刷新并标记改动）</div>
+  </div>
+
+  <div class="card col">
+    <h2>② 动作</h2>
+    <div class="form-row"><label>动作</label><select id="action" onchange="renderParams()"></select></div>
+    <div id="params"></div>
+    <button id="runBtn" onclick="run()" style="width:100%">执行</button>
+    <div id="hint" class="muted" style="margin-top:10px">选动作+勾数据后点“执行”。版本不满足的动作会被跳过并在右侧说明。</div>
+  </div>
+
+  <div class="card col result">
+    <h2>③ 结果</h2>
+    <div id="result" class="hint" style="white-space:pre-wrap">（尚未执行）</div>
+    <pre id="log" class="log">执行日志会实时显示在这里。</pre>
+  </div>
+</div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script>
+let OPTS = [];
+let SELECTED = new Set();     // 已勾选 path
+let rowsAll = [];             // 最近一次总览数据
+let BEFORE = {};              // 最近一次渲染时 path -> done[]
+let MARK = {};                // path -> 标记文本(若干)
+const STEP_NM = { inspect:"盘点", timestamps:"时间戳", clean:"清洗", merge:"合并",
+                  convert:"转换", record:"登记", annotate:"标注" };
+
+async function load() {
+  const [ov, ops] = await Promise.all([jget("/api/overview"), jget("/api/action/options")]);
+  OPTS = ops || []; renderOpts();
+  rowsAll = (ov.rows || []).filter(r => r.kind !== "not_dataset");
+  snapshot();
+  renderList();
+}
+function snapshot(){  // 记录当前状态，供执行后 diff 用
+  BEFORE = {}; for (const r of rowsAll) BEFORE[r.path] = (r.done || []).slice();
+}
+function fetchRows(){  // 重拉总览并合并手动加入的行
+  return jget("/api/overview").then(d => {
+    const rows = (d.rows || []).filter(r => r.kind !== "not_dataset");
+    for (const p of SELECTED) {
+      if (!rows.some(r => r.path === p)) {
+        rows.push({ path:p, name: p.split("/").pop(), kind:"手动", n_episodes:null,
+                    fps:null, robot_type:null, done:[], group:"手动" });
+      }
+    }
+    return rows;
+  });
+}
+
+function renderList() {
+  const box = document.getElementById("select"); clear(box);
+  const tbl = el("table");
+  tbl.innerHTML = "<thead><tr><th></th><th>名称</th><th>版本</th><th>集数</th><th>已跑步骤</th></tr></thead>";
+  const tb = el("tbody");
+  for (const r of rowsAll) {
+    const tr = el("tr");
+    const marks = (MARK[r.path] || []).map(m => `<span class="mark ${m.cls}">${m.txt}</span>`).join("");
+    tr.innerHTML = `<td><input type="checkbox" data-path="${r.path}" onchange="toggle(this)"></td>
+      <td title="${r.path}">${r.name} ${marks}</td>
+      <td>${kindChip(r.kind)}</td>
+      <td class="num">${r.n_episodes ?? ''}</td>
+      <td>${doneBadges(r.done)}</td>`;
+    if (SELECTED.has(r.path)) tr.querySelector("input").checked = true;
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb); box.appendChild(tbl);
+  refreshExtra();
+}
+function toggle(cb) {
+  if (cb.checked) SELECTED.add(cb.dataset.path); else SELECTED.delete(cb.dataset.path);
+  refreshExtra();
+}
+function addManual() {
+  const p = document.getElementById("manual_path").value.trim();
+  if (!p) return; SELECTED.add(p); document.getElementById("manual_path").value = "";
+  fetchRows().then(rs => { rowsAll = rs; snapshot(); renderList(); });
+}
+function refreshExtra(){ document.getElementById("extra").textContent = "已选 " + SELECTED.size + " 条："
+    + [...SELECTED].map(p => p.split("/").pop()).join("  |  "); }
+
+function renderOpts() {
+  const s = document.getElementById("action"); s.innerHTML = "";
+  for (const o of OPTS) { const op = el("option"); op.value=o.value; op.textContent=o.label; s.appendChild(op); }
+  renderParams();
+}
+function renderParams() {
+  const act = document.getElementById("action").value;
+  const p = document.getElementById("params"); clear(p);
+  if (act === "annotate") p.innerHTML = `<div class="hint">VLM(OpenAI 兼容) 逐集生成质量评分+建议（需在 config.yaml 配置 annotate，未配置将被拦截）。</div>`;
+  else if (act === "replay") p.innerHTML = `<div class="hint">视频复核：勾选 <b>一个</b> 数据后点“执行”会打开复核页并预选该源（点集直接播采集视频+质检提示）。</div>`;
+  else if (act === "merge") p.innerHTML = `<div class="form-row"><label>输出目录名(可空)</label><input id="out_name" type="text" placeholder="回车自动生成"></div>`;
+  else if (act === "record") p.innerHTML = `<div class="form-row"><label>登记阶段</label>
+      <select id="stage"><option value="final">final(处理后,默认)</option><option value="raw">raw(原始批次)</option></select></div>`;
+}
+
+function run() {
+  const act = document.getElementById("action").value;
+  if (SELECTED.size === 0) { setResult("请先在左侧选择至少一个数据", "fail"); return; }
+  if (act === "replay") {
+    if (SELECTED.size !== 1) { setResult("回放需选择 1 个数据集", "fail"); return; }
+    location.href = "/replay?path=" + encodeURIComponent([...SELECTED][0]);
+    return;
+  }
+  const opts = {};
+  if (act === "merge") { const n=document.getElementById("out_name"); if(n&&n.value.trim()) opts.out_name=n.value.trim(); }
+  if (act === "record") { const s=document.getElementById("stage"); if(s) opts.stage=s.value; }
+  const start = {}; for (const p of SELECTED) start[p] = (BEFORE[p] || []).slice();
+
+  const btn = document.getElementById("runBtn"); btn.disabled = true;
+  setResult("执行中…", "");
+  const logEl = document.getElementById("log"); logEl.textContent = "";
+  jget("/api/action", { method:"POST", headers:{"Content-Type":"application/json"},
+                        body: JSON.stringify({ action:act, paths:[...SELECTED], opts }) })
+    .then(res => {
+      if (res.error) { logEl.textContent = res.error; btn.disabled=false; setResult("提交失败："+res.error,"fail"); return; }
+      subscribe(logEl, res.task_id, d => refresh(act, start, d.rc));
+    });
+}
+
+async function refresh(act, start, rc) {
+  rowsAll = await fetchRows();
+  // diff 本次选中批次：执行成功后新增了哪些步骤
+  const M = {}; const byPath = {}; for (const r of rowsAll) byPath[r.path] = r;
+  for (const p of SELECTED) {
+    const r = byPath[p];
+    if (!r) { M[p] = [{txt:"× 未找到", cls:"x"}]; continue; }
+    if (rc === 0) {
+      const prev = start[p] || [], cur = r.done || [];
+      const added = cur.filter(s => !prev.includes(s));
+      M[p] = added.length ? added.map(s => ({txt:"↑"+ (STEP_NM[s]||s), cls:"up"}))
+                          : [{txt:"✔ 完成", cls:"up"}];
+    } else {
+      M[p] = [{txt:"× 未执行（见右侧日志）", cls:"x"}];
+    }
+  }
+  // 标记本次执行后新出现的产物目录（合并/转换输出）
+  for (const r of rowsAll) {
+    if (!(r.path in start) && !(r.path in BEFORE) && !(r.path in M) && r.group === "输出") {
+      M[r.path] = [{txt:"NEW · 新增产物", cls:"new"}];
+    }
+  }
+  MARK = M;
+  snapshot();
+  renderList();
+
+  const ok = rc === 0;
+  const lines = [ok ? "✔ 执行成功：" + (STEP_NM[act]||act) : "✘ 未成功执行：" + (STEP_NM[act]||act) + "（见右侧日志）"];
+  const newly = Object.entries(M).filter(([ , ms]) => ms.some(m => m.cls === "up" && (m.txt||"").startsWith("↑")));
+  if (ok && newly.length) lines.push("本次改动：" + newly.map(([p,ms]) => `${p.split("/").pop()} ${ms.map(m=>m.txt).join(" ")}`).join("；"));
+  setResult(lines.join("\n"), ok ? "ok" : "fail");
+  document.getElementById("runBtn").disabled = false;
+}
+function setResult(text, cls) {
+  const box = document.getElementById("result");
+  box.textContent = text;
+  box.className = "banner" + (cls ? " " + cls : "");
+}
+load();
+</script>
+{% endblock %}

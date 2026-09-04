@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}关节曲线回放(Rerun) · innov-dataprep{% endblock %}
+{% block content %}
+<h1>关节曲线回放（Rerun · 高级） <a href="/replay" style="font-size:13px;font-weight:400">← 返回视频复核</a></h1>
+<div class="grid three">
+  <div class="card col">
+    <h2>① 源数据集 <button class="sec" style="float:right" onclick="loadSources()">刷新</button></h2>
+    <div id="sources" class="picklist"></div>
+    <div id="cur_src" class="muted" style="margin-top:8px">（尚未选择源）</div>
+  </div>
+
+  <div class="card col">
+    <h2>② 选集 & 构建</h2>
+    <div class="form-row"><label>episode</label>
+      <select id="ep" style="flex:1;width:100%"><option value="">-- 请先选源 --</option></select>
+    </div>
+    <button onclick="build()" style="width:100%">构建回放 .rrd</button>
+    <button id="loadBtn" onclick="loadViewer()" class="sec" style="width:100%;margin-top:6px" disabled>打开回放（加载 viewer）</button>
+    <div id="buildlog" class="hint" style="margin-top:8px;min-height:80px;white-space:pre-wrap">选择源+episode，点“构建回放”生成 .rrd（状态/动作曲线，不含视频）。</div>
+  </div>
+
+  <div class="card col result">
+    <h2>③ Rerun 回放</h2>
+    <div id="result" class="hint" style="margin-bottom:8px">未加载</div>
+    <div style="flex:1;position:relative;min-height:520px">
+      <iframe id="viewer" style="position:absolute;inset:0;width:100%;height:100%;border:1px solid #e3e8ee;border-radius:8px;background:#fff"></iframe>
+    </div>
+  </div>
+</div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script>
+let SELECTED = "";
+let VIEWER_URL = "";
+
+async function loadSources() {
+  const d = await jget("/api/replay/sources");
+  const box = document.getElementById("sources"); clear(box);
+  const tbl = el("table");
+  tbl.innerHTML = "<thead><tr><th></th><th>名称</th><th>版本</th><th>已完成步</th><th>集数</th></tr></thead>";
+  const tb = el("tbody");
+  for (const r of d.rows || []) {
+    const tr = el("tr");
+    tr.innerHTML = `<td><input type="radio" name="src" data-path="${r.path}"></td>
+      <td title="${r.path}">${r.name}</td><td>${kindChip(r.kind)}</td>
+      <td>${doneBadges(r.done)}</td><td>${r.n_episodes ?? "-"}</td>`;
+    tr.querySelector("input").onchange = () => pick(r.path);
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb); box.appendChild(tbl);
+  refreshCur();
+  // 从 一键动作 跳转进来时预选源
+  const pre = new URLSearchParams(location.search).get("path");
+  if (pre && d.rows && d.rows.some(r => r.path === pre)) pick(pre);
+  else if (pre) setLog("所选源不在回放列表（非 v2.1/v3.0？），请手动选择。");
+}
+function pick(path) {
+  SELECTED = path;
+  document.getElementById("cur_src").textContent = "当前源：" + (SELECTED || "(未选择)");
+  const inputs = document.querySelectorAll('input[name="src"]');
+  inputs.forEach(i => { if (i.dataset.path === SELECTED) i.checked = true; });
+  loadEps();
+}
+async function loadEps() {
+  const sel = document.getElementById("ep"); clearOptions(sel);
+  if (!SELECTED) return;
+  const d = await jget("/api/replay/episodes?path=" + encodeURIComponent(SELECTED));
+  const eps = d.episodes || [];
+  if (!eps.length) { setLog("该数据集无可用 episode。"); return; }
+  for (const e of eps) {
+    const o = el("option"); o.value = e.episode;
+    o.textContent = e.n_rows > 0 ? `ep${e.episode} · ${e.n_rows} 帧` : `ep${e.episode}`;
+    sel.appendChild(o);
+  }
+  setResult("已加载 " + eps.length + " 集，请选择并“构建回放”。", "");
+  setLog("");
+}
+function build() {
+  const ep = document.getElementById("ep").value;
+  if (!SELECTED || ep === "") { setLog("请先选源与 episode。"); return; }
+  document.getElementById("loadBtn").disabled = true;
+  setResult("构建中…", ""); setLog("构建中…");
+  jget("/api/replay/build", { method:"POST", headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({ path: SELECTED, episode: parseInt(ep,10) }) })
+    .then(async res => {
+      if (res.cached) { setLog("已缓存，直接加载。"); enableLoad(); loadViewer(); return; }
+      if (res.error) { setLog("提交失败：" + res.error); return; }
+      subscribe(document.getElementById("buildlog"), res.task_id, d => {
+        if (d.rc === 0) { setResult("✔ .rrd 构建完成", "ok"); enableLoad(); loadViewer(); }
+        else { setResult("✘ 构建失败，见左侧日志", "fail"); }
+      });
+    });
+}
+function enableLoad() { document.getElementById("loadBtn").disabled = false; }
+async function loadViewer() {
+  const ep = document.getElementById("ep").value;
+  if (!SELECTED || ep === "") return;
+  setResult("加载 viewer…", "");
+  const v = await jget("/api/replay/viewer");
+  VIEWER_URL = v.url || "";
+  const rrdUrl = location.origin + "/api/replay/rrd?path=" + encodeURIComponent(SELECTED)
+               + "&ep=" + encodeURIComponent(ep);
+  const src = VIEWER_URL + "?url=" + encodeURIComponent(rrdUrl);
+  document.getElementById("viewer").src = src;
+  setResult(`✔ 已在 viewer 加载 ep${ep}（若为空白请稍候初始化）`, "ok");
+}
+function clearOptions(sel) { while (sel.firstChild) sel.removeChild(sel.firstChild); sel.appendChild(el("option", "", "-- 加载中 --")); }
+function setLog(t) { (document.getElementById("buildlog")).textContent = t; }
+function setResult(t, cls) {
+  const b = document.getElementById("result");
+  b.textContent = t; b.className = "banner" + (cls ? " " + cls : (t.startsWith("✔")||t.startsWith("已")) ? " ok" : "");
+}
+loadSources();
+</script>
+{% endblock %}

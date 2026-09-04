@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}质检与处理 · innov-dataprep{% endblock %}
+{% block content %}
+<h1>质检与处理建议（检测后哪些数据有问题、怎么处理）</h1>
+<p class="muted">仅展示已执行<strong>清洗质检(03)</strong>的数据集。每条数据 = 一集；<b style="color:#a52222">红 = 排除</b>（不送训练，原始数据保留），<b style="color:#1c7a1c">绿 = 保留</b>。点左侧批次看逐集明细与处理建议。</p>
+<div class="grid two" style="align-items:stretch">
+  <div class="card col">
+    <h2>已质检数据集</h2>
+    <div id="list" class="picklist"></div>
+  </div>
+  <div class="card col">
+    <h2 id="dtitle">批次明细</h2>
+    <div id="detail" class="result">
+      <div id="dsum" class="hint"></div>
+      <div id="dtable"></div>
+    </div>
+  </div>
+</div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script>
+let DATA = {batches: []};
+
+async function load() {
+  DATA = await jget("/api/qc");
+  renderList();
+  const cur = document.querySelector("#list tr.sel");
+  if (!cur && DATA.batches.length) show(DATA.batches[0].path);
+}
+
+function renderList() {
+  const box = document.getElementById("list"); clear(box);
+  if (!DATA.batches.length) { box.appendChild(el("div","muted","暂无已清洗质检的数据集。先在“一键动作”里对某批执行 清洗质检(03)。")); return; }
+  const tbl = el("table");
+  tbl.innerHTML = "<thead><tr><th>名称</th><th>保留</th><th>排除</th><th>警告</th></tr></thead>";
+  const tb = el("tbody");
+  for (const b of DATA.batches) {
+    const tr = el("tr"); tr.dataset.path = b.path;
+    tr.onclick = () => show(b.path);
+    tr.innerHTML = `<td>${b.name}</td>
+      <td class="num" style="color:#1c7a1c">${b.n_keep}</td>
+      <td class="num" style="color:${b.n_exclude? '#a52222' : '#888'}">${b.n_exclude}</td>
+      <td class="num" style="color:${b.n_warn? '#8a5b00' : '#888'}">${b.n_warn}</td>`;
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb); box.appendChild(tbl);
+}
+
+function show(path) {
+  const b = DATA.batches.find(x => x.path === path); if (!b) return;
+  document.querySelectorAll("#list tr").forEach(r => r.classList.toggle("sel", r.dataset.path === path));
+  document.title = b.name + " · 质检";
+  document.getElementById("dtitle").textContent = b.name;
+  const sum = document.getElementById("dsum");
+  const cls = b.n_exclude ? "banner fail" : "banner ok";
+  sum.className = cls;
+  sum.textContent = "keep " + b.n_keep + " / exclude " + b.n_exclude + " / warn " + b.n_warn
+    + (b.excluded_episodes && b.excluded_episodes.length
+       ? "　排除集：" + b.excluded_episodes.join(", ") : "")
+    + "\n清洗目录：" + (b.clean_dir || "-");
+  const box = document.getElementById("dtable"); clear(box);
+  const tbl = el("table");
+  tbl.innerHTML = "<thead><tr><th>集</th><th>行数</th><th>时长</th><th>判定</th><th>问题</th><th>处理建议</th></tr></thead>";
+  const tb = el("tbody");
+  for (const e of b.per_episode) {
+    const v = e.verdict === "exclude";
+    const probs = e.reasons_exclude.concat(e.reasons_warn);
+    const tr = el("tr");
+    tr.innerHTML = `<td>${e.episode}</td><td class="num">${e.n_rows || ''}</td>
+      <td class="num">${e.duration_s || ''}</td>
+      <td><span class="chip ${v?'nodata':'ok'}">${v?'排除':'保留'}</span></td>
+      <td>${(probs.length? probs.join('<br>') : '<span class="muted">无</span>')}</td>
+      <td>${e.handling || '<span class="muted">—</span>'}</td>`;
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb); box.appendChild(tbl);
+}
+load();
+</script>
+{% endblock %}

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}innov-dataprep{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+<aside class="nav">
+  <div class="brand">innov-dataprep</div>
+  <a href="/" class="{{ 'active' if request.path == '/' }}">批次总览</a>
+  <a href="/action" class="{{ 'active' if request.path == '/action' }}">一键动作</a>
+  <a href="/qc" class="{{ 'active' if request.path == '/qc' }}">质检与处理</a>
+  <a href="/replay" class="{{ 'active' if request.path.startswith('/replay') }}">视频复核</a>
+  <a href="/deliver" class="{{ 'active' if request.path == '/deliver' }}">交付</a>
+  <a href="/ledger" class="{{ 'active' if request.path == '/ledger' }}">台账</a>
+</aside>
+<main class="main">
+  {% block content %}{% endblock %}
+</main>
+<footer class="foot">
+  <span>本地工具，仅 127.0.0.1 · 动作可逆/软标记，不删除原始数据</span>
+  <a href="/api/health" target="_blank">health</a>
+</footer>
+</body>
+</html>

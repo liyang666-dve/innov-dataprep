@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}视频复核 · innov-dataprep{% endblock %}
+{% block content %}
+<h1>视频复核（点集 → 看采集视频 → 按质检提示处理）</h1>
+<div class="grid three">
+  <div class="card col">
+    <h2>① 源数据集 <button class="sec" style="float:right" onclick="loadSources()">刷新</button></h2>
+    <div id="sources" class="picklist"></div>
+    <div id="cur_src" class="muted" style="margin-top:8px">（尚未选择源）</div>
+    <a href="/replay/curves" class="muted" style="display:inline-block;margin-top:10px;font-size:12px">关节曲线回放（高级 · Rerun）→</a>
+  </div>
+
+  <div class="card col">
+    <h2>② Episode 列表</h2>
+    <div id="epinfo" class="muted" style="margin-bottom:6px">先选左侧数据集</div>
+    <div id="eps" class="picklist" style="max-height:620px;overflow:auto"></div>
+  </div>
+
+  <div class="card col result">
+    <h2>③ 采集视频</h2>
+    <div id="cams" class="toolbar" style="margin-bottom:8px"></div>
+    <div id="verdict" class="hint" style="margin-bottom:8px;min-height:40px;white-space:pre-wrap">点击左侧某一集开始播放。</div>
+    <video id="player" controls muted playsinline
+           style="width:100%;max-height:520px;background:#000;border-radius:8px"></video>
+    <div id="vpinfo" class="muted" style="margin-top:6px;font-size:12px"></div>
+  </div>
+</div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+<script>
+let SRC = "";            // 当前数据集 path
+let META = null;         // /api/review/episodes 返回
+let CUR = null;          // 当前 episode 对象
+let CUR_CAM = "";
+
+async function loadSources() {
+  const d = await jget("/api/replay/sources");
+  const box = document.getElementById("sources"); clear(box);
+  const tbl = el("table");
+  tbl.innerHTML = "<thead><tr><th></th><th>名称</th><th>版本</th><th>集数</th></tr></thead>";
+  const tb = el("tbody");
+  for (const r of d.rows || []) {
+    const tr = el("tr");
+    tr.innerHTML = `<td><input type="radio" name="src" data-path="${r.path}"></td>
+      <td title="${r.path}">${r.name}</td><td>${kindChip(r.kind)}</td><td>${r.n_episodes ?? "-"}</td>`;
+    tr.querySelector("input").onchange = () => pick(r.path);
+    if (r.path === SRC) tr.querySelector("input").checked = true;
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb); box.appendChild(tbl);
+  const pre = new URLSearchParams(location.search).get("path");
+  if (pre && !SRC && d.rows && d.rows.some(r => r.path === pre)) pick(pre);
+}
+function pick(path) {
+  SRC = path; CUR = null;
+  document.getElementById("cur_src").textContent = "当前源：" + path.split("/").pop();
+  loadEps();
+}
+function verdictChip(v) {
+  if (v === "keep") return '<span class="chip" style="background:#e6f6ec;color:#186a3b">✓ 保留</span>';
+  if (v === "exclude") return '<span class="chip" style="background:#fdecea;color:#942a25">✗ 排除</span>';
+  return '<span class="chip" style="background:#eef1f4;color:#7b8694">未质检</span>';
+}
+async function loadEps() {
+  const box = document.getElementById("eps"); clear(box);
+  document.getElementById("epinfo").textContent = "加载中…";
+  META = await jget("/api/review/episodes?path=" + encodeURIComponent(SRC));
+  if (META.error) { document.getElementById("epinfo").textContent = META.error; return; }
+  document.getElementById("epinfo").innerHTML =
+    `${META.name} · ${META.kind} · ${META.episodes.length} 集 · ` +
+    (META.cleaned ? '<span style="color:#186a3b">已清洗</span>' : '<span style="color:#b7791f">未清洗（无质检结论）</span>');
+  const tbl = el("table");
+  tbl.innerHTML = "<thead><tr><th>集</th><th>时长</th><th>结论</th><th>原因 / 建议</th></tr></thead>";
+  const tb = el("tbody");
+  for (const e of META.episodes) {
+    const tr = el("tr"); tr.className = "row-link";
+    const why = (e.reasons && e.reasons.length) ? e.reasons.join("；") + " → " : "";
+    tr.innerHTML = `<td>ep${e.episode}</td>
+      <td class="num">${e.duration_s != null ? e.duration_s + 's' : '-'}</td>
+      <td>${verdictChip(e.verdict)}</td>
+      <td style="white-space:normal;font-size:12px" title="${(e.reasons||[]).join('；')}">${why}${e.handling || ''}</td>`;
+    tr.onclick = () => play(e, tr);
+    tb.appendChild(tr);
+  }
+  tbl.appendChild(tb); box.appendChild(tbl);
+}
+
+function play(e, tr) {
+  CUR = e;
+  document.querySelectorAll("#eps tr.row-link").forEach(x => x.style.background = "");
+  if (tr) tr.style.background = "#eef6ff";
+  renderCams();
+}
+function renderCams() {
+  const bar = document.getElementById("cams"); clear(bar);
+  if (!CUR || !META || !META.cameras || !META.cameras.length) {
+    setVerdict("该数据集没有机位视频。"); return;
+  }
+  if (!META.cameras.includes(CUR_CAM)) CUR_CAM = META.cameras[0];
+  for (const c of META.cameras) {
+    const b = el("button", c === CUR_CAM ? "" : "sec", c.replace("observation.images.", ""));
+    b.style.marginRight = "6px";
+    b.onclick = () => { CUR_CAM = c; renderCams(); };
+    bar.appendChild(b);
+  }
+  const why = (CUR.reasons && CUR.reasons.length) ? "\n原因：" + CUR.reasons.join("；") : "";
+  setVerdict(`ep${CUR.episode} · ${verdictText(CUR.verdict)} · 建议：${CUR.handling || "-"}${why}`);
+  loadVideo();
+}
+function verdictText(v) { return v === "keep" ? "质检✓保留" : v === "exclude" ? "质检✗排除" : "未质检"; }
+function setVerdict(t) { document.getElementById("verdict").textContent = t; }
+
+async function loadVideo() {
+  const v = document.getElementById("player");
+  const url = `/api/review/video?path=${encodeURIComponent(SRC)}&ep=${CUR.episode}&cam=${encodeURIComponent(CUR_CAM)}`;
+  let src = url;
+  let end = null;
+  if (META.kind === "v3.0" && CUR.window && CUR.window[CUR_CAM]) {
+    const [s, e2] = CUR.window[CUR_CAM]; end = e2;
+    src = url + `#t=${s.toFixed(3)},${e2.toFixed(3)}`;   // 媒体片段：从该集起点起播，到点停
+  }
+  v.dataset.end = end != null ? String(end) : "";
+  v.src = src;
+  v.onloadedmetadata = () => {
+    if (META.kind === "v3.0" && CUR.window && CUR.window[CUR_CAM]) {
+      const s = CUR.window[CUR_CAM][0];
+      if (Math.abs(v.currentTime - s) > 0.5) v.currentTime = s;  // 兜底：确保从起点播
+    }
+    document.getElementById("vpinfo").textContent =
+      `${CUR_CAM.replace("observation.images.","")} · ep${CUR.episode}` +
+      (end != null ? ` · 片段 ${CUR.window[CUR_CAM][0].toFixed(1)}s ~ ${end.toFixed(1)}s（大视频按时间窗截取）` : " · 单集文件");
+    v.play().catch(()=>{});
+  };
+  v.ontimeupdate = () => {
+    const end = parseFloat(v.dataset.end || "");
+    if (end && v.currentTime >= end) { v.pause(); v.currentTime = parseFloat(CUR.window[CUR_CAM][0]); }
+  };
+  v.onerror = () => { document.getElementById("vpinfo").textContent = "视频加载失败（AV1 编码请用 Chrome/Edge 打开）"; };
+}
+loadSources();
+</script>
+{% endblock %}
