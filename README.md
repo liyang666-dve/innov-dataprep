@@ -19,7 +19,8 @@
 ## 2. 快速开始
 
 ```bash
-git clone git@github.com:liyang666-dve/innov-dataprep.git   # 私有仓库需本机配好 GitHub 认证；公开后零认证
+git clone https://github.com/liyang666-dve/innov-dataprep.git   # 公开后零认证，任何电脑可用
+# （私有阶段或要 push 的机器用 SSH: git clone git@github.com:liyang666-dve/innov-dataprep.git，需配好 GitHub SSH key）
 cd innov-dataprep
 bash setup.sh                        # 复用 lerobot conda 环境 / 建 .venv / 兜底系统 python3，自动装依赖
 cp config.example.yaml config.yaml   # 只需改 paths 3 个路径（见"配置速查表"）
