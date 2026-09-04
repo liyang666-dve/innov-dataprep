@@ -17,7 +17,17 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT.parent))
 
-from flask import Flask, render_template, request, Response, jsonify, send_file  # noqa: E402
+try:
+    from flask import Flask, render_template, request, Response, jsonify, send_file  # noqa: E402
+except ModuleNotFoundError as e:
+    if getattr(e, "name", None) == "flask":
+        print("[ERROR] 缺少 flask（Web 界面依赖，可选）。请先安装：")
+        print("        pip install flask          # 基础 Web")
+        print("        pip install rerun-sdk      # 回放页/一键回放（不需要可跳过）")
+        print("    或在仓库根目录跑 bash setup.sh（自动复用当前 conda 环境并装齐依赖）")
+    else:
+        print(f"[ERROR] 缺少依赖模块: {e.name}")
+    sys.exit(1)
 
 import backend  # noqa: E402
 import transfer  # noqa: E402
