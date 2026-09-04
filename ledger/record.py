@@ -232,8 +232,8 @@ def _main() -> int:
 
     ds = Path(args.batch)
     kind, reason = dataset_io.detect_dataset(ds)
-    if kind != "v2.1":
-        print(f"[ERROR] 拒绝登记：{ds.name} 不是 v2.1 数据集 -> {reason}")
+    if kind not in ("v2.1", "v3.0"):
+        print(f"[ERROR] 拒绝登记：{ds.name} 不是 v2.1/v3.0 数据集 -> {reason}")
         return 1
 
     cfg = load_config(Path(args.config))

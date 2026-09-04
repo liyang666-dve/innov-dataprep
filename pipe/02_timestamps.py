@@ -56,45 +56,48 @@ def dropped_windows(df: pd.DataFrame) -> list[dict[str, float]]:
     return wins
 
 
-def run_dataset(ds: Path, out_root: Path) -> tuple[int, list[dict]]:
-    """返回 (问题数, 窗口行)。"""
-    fps = 30.0
-    eps_paths = dataset_io.discover_episodes(ds)
-    rows: list[dict] = []
-    all_windows: list[dict] = []
-    n_problems = 0
-    for p in eps_paths:
-        df = pd.read_parquet(p)
-        n = len(df)
-        wins = dropped_windows(df)
-        for w in wins:
-            w2 = {"dataset": ds.name, "episode": dataset_io.episode_index(p), **w}
-            all_windows.append(w2)
-        row = {
-            "episode": dataset_io.episode_index(p),
-            "n_rows": n,
-            "n_duplicate_ts": int((df["timestamp"].diff() <= 0).sum()) if "timestamp" in df.columns else 0,
-            "n_backward_ts": int((df["timestamp"].diff() < 0).sum()) if "timestamp" in df.columns else 0,
-            "n_windows": len(wins),
-            "dropped_est_total": sum(w["dropped_est"] for w in wins),
-            "max_gap_s": round(max((w["gap_s"] for w in wins), default=0.0), 4),
-        }
-        if "timestamp" in df.columns:
-            t = df["timestamp"].to_numpy(dtype=np.float64)
-            t = t[np.isfinite(t)]
-            if t.size >= 2:
-                d = np.diff(t)
-                med = float(np.median(d))
-                row["median_dt"] = round(med, 6)
-                row["actual_fps"] = round((n - 1) / float(t[-1] - t[0]), 3) if t[-1] > t[0] else None
+def _audit_episode(df: "pd.DataFrame", ds_name: str, ep: int) -> tuple[dict, list[dict]]:
+    """对单集 df 做时间戳审计，返回 (row, 已带 dataset/episode 的窗口行)。"""
+    n = len(df)
+    wins = dropped_windows(df)
+    all_wins = [{"dataset": ds_name, "episode": ep, **w} for w in wins]
+    row = {
+        "episode": ep,
+        "n_rows": n,
+        "n_duplicate_ts": int((df["timestamp"].diff() <= 0).sum()) if "timestamp" in df.columns else 0,
+        "n_backward_ts": int((df["timestamp"].diff() < 0).sum()) if "timestamp" in df.columns else 0,
+        "n_windows": len(wins),
+        "dropped_est_total": sum(w["dropped_est"] for w in wins),
+        "max_gap_s": round(max((w["gap_s"] for w in wins), default=0.0), 4),
+    }
+    if "timestamp" in df.columns:
+        t = df["timestamp"].to_numpy(dtype=np.float64)
+        t = t[np.isfinite(t)]
+        if t.size >= 2:
+            d = np.diff(t)
+            med = float(np.median(d))
+            row["median_dt"] = round(med, 6)
+            row["actual_fps"] = round((n - 1) / float(t[-1] - t[0]), 3) if t[-1] > t[0] else None
+    return row, all_wins
+
+
+def _run_dataset_v30(ds: Path, out_root: Path) -> tuple[int, list[dict]]:
+    rows, all_windows, n_problems = [], [], 0
+    for ep, df in dataset_io.iter_v3_episodes(ds):
+        row, wins = _audit_episode(df, ds.name, ep)
         rows.append(row)
+        all_windows.extend(wins)
         if row["n_windows"] > 0 or row["n_duplicate_ts"] > 0:
             n_problems += 1
+    _write_report(ds, out_root, rows, all_windows, n_problems)
+    return n_problems, all_windows
 
+
+def _write_report(ds: Path, out_root: Path, rows: list[dict], all_windows: list[dict],
+                  n_problems: int) -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     report.write_csv(out_root / "timestamps_summary.csv", rows)
     report.write_csv(out_root / "dropped_windows.csv", all_windows)
-
     lines = [
         f"# 时间戳审计: {ds.name}",
         "",
@@ -119,7 +122,27 @@ def run_dataset(ds: Path, out_root: Path) -> tuple[int, list[dict]]:
         "- 所有集都系统性丢帧：先查采集链路（USB 带宽 / CPU 抢占 / CAN 掉线），再批量重采。",
         "",
     ]
-    report.write_md(out_root / "timestamps_report.md", report_lines := lines)
+    report.write_md(out_root / "timestamps_report.md", lines)
+
+
+def run_dataset(ds: Path, out_root: Path) -> tuple[int, list[dict]]:
+    """返回 (问题数, 窗口行)。v2.1/v3.0 均支持。"""
+    if dataset_io.detect_dataset(ds)[0] == "v3.0":
+        return _run_dataset_v30(ds, out_root)
+    fps = 30.0
+    eps_paths = dataset_io.discover_episodes(ds)
+    rows: list[dict] = []
+    all_windows: list[dict] = []
+    n_problems = 0
+    for p in eps_paths:
+        df = pd.read_parquet(p)
+        row, wins = _audit_episode(df, ds.name, dataset_io.episode_index(p))
+        rows.append(row)
+        all_windows.extend(wins)
+        if row["n_windows"] > 0 or row["n_duplicate_ts"] > 0:
+            n_problems += 1
+
+    _write_report(ds, out_root, rows, all_windows, n_problems)
     return n_problems, all_windows
 
 
@@ -132,11 +155,11 @@ def main() -> int:
     for ds_str in args.input:
         ds = Path(ds_str)
         kind, reason = dataset_io.detect_dataset(ds)
-        if kind != "v2.1":
-            print(f"[跳过] {ds.name} 不是 v2.1 数据集: {reason}")
+        if kind not in ("v2.1", "v3.0"):
+            print(f"[跳过] {ds.name} 不是 v2.1/v3.0 数据集: {reason}")
             rc = 1
             continue
-        out = Path(args.out) if args.out else ds.parent / f"{ds.name}_timestamps"
+        out = Path(args.out) if args.out else dataset_io.new_stage_dir(ds, "timestamps")
         n, wins = run_dataset(ds, out)
         print(f"[OK] {ds.name}: 问题集 {n}，丢帧窗口 {len(wins)} -> {out / 'timestamps_report.md'}")
     return rc

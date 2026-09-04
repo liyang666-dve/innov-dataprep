@@ -115,7 +115,9 @@ def discover_dispositions(inputs: list[Path], explicit: list[str | None],
         if explicit and i < len(explicit) and explicit[i]:
             cand = Path(explicit[i])
         else:
-            cand = src.parent / f"{src.name}_clean" / "episode_disposition.csv"
+            # 清洗清单：新布局 _products/clean 优先，兼容旧平铺 _clean
+            f = dataset_io.stage_file(src, "clean", "episode_disposition.csv")
+            cand = f if f else (src.parent / f"{src.name}_clean" / "episode_disposition.csv")
         disp = load_disposition(cand)
         if disp is None and not (explicit and i < len(explicit) and explicit[i]):
             print(f"[WARN] 未找到 {src.name} 的处置清单（{cand}），该源将全部并入；"

@@ -111,8 +111,8 @@ def main() -> int:
     for ds_str in args.input:
         ds = Path(ds_str)
         kind, reason = dataset_io.detect_dataset(ds)
-        if kind != "v2.1":
-            print(f"[跳过] {ds.name} 不是 v2.1 数据集: {reason}")
+        if kind not in ("v2.1", "v3.0"):
+            print(f"[跳过] {ds.name} 不是 v2.1/v3.0 数据集: {reason}")
             rc = 1
             continue
         fps = args.fps if args.fps else None
@@ -120,7 +120,8 @@ def main() -> int:
                                                check_videos=not args.no_video_check)
         if not args.no_video_check and video_utils.FFPROBE is None:
             print(f"[WARN] ffprobe 不可用，{ds.name} 的视频帧数核对已跳过（sudo apt install ffmpeg）")
-        out_dir = Path(args.out) if args.out else ds.parent / f"{ds.name}_inspect"
+        # 产物收进原始旁唯一产品夹 _products/inspect（.write_* 会自建目录）
+        out_dir = Path(args.out) if args.out else dataset_io.new_stage_dir(ds, "inspect")
         report.write_csv(out_dir / "episodes_summary.csv", build_csv_rows(summary))
         report.write_json(out_dir / "summary.json", summary)
         report.write_md(out_dir / "report.md", build_md(summary))

@@ -75,8 +75,12 @@ def _state_arrays(df: pd.DataFrame) -> tuple[list[str], np.ndarray]:
 
 
 def check_episode(df: pd.DataFrame, meta_info: dict, qc: dict, nominal_fps: float,
-                  video_summary: dict[str, dict]) -> dict[str, Any]:
-    """对单个 episode 执行全部检查。返回 verdict/reasons/warnings 等。"""
+                  video_summary: dict[str, dict], check_joints: bool = True) -> dict[str, Any]:
+    """对单个 episode 执行全部检查。返回 verdict/reasons/warnings 等。
+
+    check_joints=False 时跳过关节限位/跳变/卡死检查（v3.0 用：保持与数组列形态的
+    v2.1 行为一致——v2.1 单数组列不展开，本检查本就不触发，故 v3.0 也不误判持物静止）。
+    """
     n = len(df)
     exclude: list[str] = []
     warn: list[str] = []
@@ -126,8 +130,8 @@ def check_episode(df: pd.DataFrame, meta_info: dict, qc: dict, nominal_fps: floa
     if bad:
         exclude.append(f"NaN/Inf {bad} 个")
 
-    # --- 关节：限位 / 跳变 / 卡死
-    joint_cols, J = _state_arrays(df)
+    # --- 关节：限位 / 跳变 / 卡死（v3.0 关闭，见 check_joints）
+    joint_cols, J = (_state_arrays(df) if check_joints else ([], np.zeros((len(df), 0))))
     if joint_cols and J.shape[1]:
         with np.errstate(all="ignore"):
             lim = qc["joint_limits_rad"]
@@ -222,6 +226,8 @@ def blur_check(video_summary: dict, qc: dict) -> dict[str, Any]:
 
 # ---------------------------------------------------------------- 主流程
 def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
+    if dataset_io.detect_dataset(ds)[0] == "v3.0":
+        return _run_dataset_v30(ds, qc, args)
     meta = dataset_io.read_meta(ds)
     info = meta["info"]
     nominal = float(info.get("fps") or args.fps or 30.0)
@@ -272,7 +278,17 @@ def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
     n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
     n_excl = len(ep_rows) - n_keep
 
-    out_root = Path(args.out) if args.out else ds.parent / f"{ds.name}_clean"
+    out_root = Path(args.out) if args.out else dataset_io.new_stage_dir(ds, "clean")
+    return _finalize_qc(ds, out_root, ep_rows, nominal, n_keep, n_excl)
+
+
+def _finalize_qc(ds: Path, out_root: Path, ep_rows: list[dict], nominal: float,
+                 n_keep: int | None = None, n_excl: int | None = None) -> dict:
+    """写 episode_disposition.csv / summary.json / qc_report.md（v2.1/v3.0 共用）。"""
+    if n_keep is None:
+        n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
+    if n_excl is None:
+        n_excl = len(ep_rows) - n_keep
     out_root.mkdir(parents=True, exist_ok=True)
 
     rows = []
@@ -311,6 +327,38 @@ def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
     return summary
 
 
+def _run_dataset_v30(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
+    """v3.0 清洗/质检：逐集 df 已展开成 v2.1 风格列，check_episode 复用；
+    逐集视频按 meta/episodes 的 from/to_timestamp 在每机位大 mp4 上切窗核对。
+    模糊检查(blur)对 v3.0 跳过（无单集视频文件，整形 mp4 过重）。"""
+    meta = dataset_io.read_meta(ds)
+    info = meta["info"]
+    nominal = float(info.get("fps") or args.fps or 30.0)
+    cams = dataset_io._v3_cameras(ds, info)
+    eps_meta = dataset_io._v3_episodes_meta(ds)
+    do_videos = not args.no_video_check
+    qc["check_blur"] = False  # v3.0 跳过模糊
+    if args.blur:
+        print(f"[WARN] {ds.name} 为 v3.0，模糊检查自动跳过（无单集视频文件）")
+
+    if do_videos and video_utils.FFPROBE is None:
+        print(f"[WARN] ffprobe 不可用，{ds.name} 的视频帧数核对跳过（sudo apt install ffmpeg）")
+    print(f"[INFO] {ds.name} 为 v3.0，关节限位/跳变/卡死检查跳过（与数组列 v2.1 行为一致）")
+    vid_by_ep = (dataset_io._v3_episode_video_summary(ds, eps_meta, cams)
+                 if do_videos else {})
+    ep_rows = []
+    for ep, df in dataset_io.iter_v3_episodes(ds):
+        vsum = vid_by_ep.get(ep, {})
+        q = check_episode(df, info, qc, nominal, vsum, check_joints=False)
+        ep_rows.append({"episode": ep, "n_rows": len(df), "_qc": q, "videos": vsum})
+
+    ep_rows.sort(key=lambda x: x["episode"])
+    n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
+    n_excl = len(ep_rows) - n_keep
+    out_root = Path(args.out) if args.out else dataset_io.new_stage_dir(ds, "clean")
+    return _finalize_qc(ds, out_root, ep_rows, nominal, n_keep, n_excl)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="LeRobot v2.1 清洗/质检（软标记，只读）")
     ap.add_argument("--input", action="append", required=True)
@@ -325,8 +373,8 @@ def main() -> int:
     for s in args.input:
         ds = Path(s)
         kind, reason = dataset_io.detect_dataset(ds)
-        if kind != "v2.1":
-            print(f"[跳过] {ds.name} 不是 v2.1 数据集: {reason}")
+        if kind not in ("v2.1", "v3.0"):
+            print(f"[跳过] {ds.name} 不是 v2.1/v3.0 数据集: {reason}")
             rc = 1
             continue
         summary = run_dataset(ds, qc, args)
