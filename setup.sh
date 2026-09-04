@@ -55,8 +55,8 @@ if ! pip_install numpy pandas pyarrow PyYAML; then
   echo "[ERROR] 核心依赖安装失败（见上方输出）。conda 用户请检查网络；venv 用户请确认 pip 可用。"
   exit 1
 fi
-if ! pip_install opencv-python-headless av rerun-sdk; then
-  echo "    ⚠ 可选依赖（opencv/av/rerun-sdk）安装失败，模糊检查/视频解码/Rerun 回放不可用，其余功能不受影响。"
+if ! pip_install opencv-python-headless av rerun-sdk flask; then
+  echo "    ⚠ 可选依赖（opencv/av/rerun-sdk/flask）安装失败，模糊检查/视频解码/Rerun 回放/Web 界面不可用，其余功能不受影响。"
 fi
 
 echo "==> 3/4 检查 ffprobe（视频帧数核对用，缺少则该项明确提示、自动跳过）..."
