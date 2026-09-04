@@ -38,12 +38,13 @@ qc:
   blur_sample_frames: 200    # 每相机抽帧上限（控成本）
 
 annotate:
-  # —— 预留：04 标注 LLM 建议（采集机能联网时启用；OpenAI 兼容接口，可填 DeepSeek/通义）——
+  # —— 09 标注：VLM 逐集质量评分+建议（采集机能联网时启用；OpenAI 兼容接口，可填 DeepSeek/通义）——
+  #    enabled: true 后还需填 base_url / model / api_key_env（环境变量名，存放 API Key）
   enabled: false
   base_url: ""
   model: ""
   api_key_env: ""
 
 merge:
-  # —— 预留：05 合并，由你显式指定要合并的目录（2 个或 3 个）——
+  # —— 预留占位：合并不用配这里，用 run.py 命令勾选批次（run.py merge 1,2,3）——
   inputs: []
