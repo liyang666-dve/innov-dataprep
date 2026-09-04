@@ -85,10 +85,10 @@ def scan_batches(root: Path) -> list[dict]:
         print(f"[ERROR] 批次目录不存在: {root}")
         return out
     for child in sorted(root.iterdir()):
-        if not child.is_dir() or child.name.startswith("."):
+        if not child.is_dir() or child.name.startswith((".", "_")):
             continue
-        # 产物/备份目录不是数据集，不入列表（产品夹 _products、06 转换留的 _old 备份）
-        if child.name.endswith(("_products", "_old")):
+        # 产物/备份/缓存目录不是数据集，不入列表（产品夹 _products、06 转换留的 _old 备份）
+        if child.name.endswith(("_products", "_old")) or child.name == "__pycache__":
             continue
         info = dataset_io.summarize_light(child)
         out.append(info)
