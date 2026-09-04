@@ -2,7 +2,7 @@
 
 机器人**采集数据的处理 + 登记**流水线，适用于 LeRobot **v2.1 / v3.0** 数据集（innov / ARX 双臂）。
 
-- 处理：`pipe/` —— 盘点 → 时间戳审计 → 清洗质检 → 合并 → VLM 标注 → 转 v3.0 →（校验/打包规划中）
+- 处理：`pipe/` —— 盘点 → 时间戳审计 → 清洗质检 → 合并 → VLM 标注 → 转 v3.0 → 校验 → 打包交付
 - 登记：`ledger/` —— 每个最终数据集生成"登记卡" → 台账 `data_catalog.csv` → 多机台账汇总
 
 全部是命令行脚本，**克隆即用**：`git clone` → `bash setup.sh` → `cp config.example.yaml config.yaml` 改路径 → `python3 run.py` 菜单式操作。另有本地 Web 界面（回放/盲审/台账/一键动作）。
@@ -12,7 +12,7 @@
 | 机器 | 角色 | 跑什么 |
 |---|---|---|
 | 采集机 A | robodeploy 采集 + 批次处理 + 合并 + 标注 + 转 v3.0 | `run.py` 全套（01/02/03/05/06/09/登记）+ Web |
-| 训练机 C | 接收交付包直接训练 | `07_verify --delivery`（07 规划中） |
+| 训练机 C | 接收交付包直接训练 | `sha256sum -c` 或 `07_verify --delivery` 整包核验
 | 第四台电脑 | 台账汇总 | `ledger/aggregate.py --dir <各机台账目录>` |
 | 本机（开发机） | 仓库开发 | 假数据自测（无需机器人/网络） |
 
@@ -31,11 +31,14 @@ python3 run.py list                  # 只看数据+状态（状态 ✓ 表示�
 python3 run.py clean 1,2             # 清洗质检批次 1、2（编号见 list）
 python3 run.py merge 1,2,3           # 合并：想合并哪些就勾哪些（≥2 批）
 python3 run.py convert 4             # 转 v3.0（输出组的合并产物；自动留 v2.1 备份）
+python3 run.py verify 4             # 校验：结构 smoke + 数据集 sha256 清单（转完必跑）
+python3 run.py pack 4               # 打包：tar.gz + sha256sums.txt 交付训练机
 python3 run.py annotate 1,2          # VLM 逐集质量评分+建议（需配好 annotate 段与 API Key）
 python3 run.py record 3              # 登记（数据处理达标后）
 
 # 底层脚本 / Web
 python3 pipe/03_clean.py --input <数据集> --blur          # 精细控制时
+python3 pipe/07_verify.py --delivery xxx_delivery.tar.gz  # 训练机整包核验（sha256 + 结构）
 python3 web/app.py                   # 本地 Web：默认 http://127.0.0.1:8000（端口可用参数改）
 ```
 
@@ -57,7 +60,7 @@ python3 web/app.py                   # 本地 Web：默认 http://127.0.0.1:8000
 
 ## 4. 处理与登记流程
 
-**规则**：想处理哪批就处理哪批、想合并哪些就合并哪些。每批采完先**轻检查**（01/02/03，只报告、软标记坏集、**绝不删数据**）→ 你**显式指定**的若干批次**合并**成一个集（自动排除坏集）→ 合并后统一标注/清洗 → **转 v3.0**（v2.1 自动备份 `<名字>_old`）→ 校验/打包 → 训练机直训。
+**规则**：想处理哪批就处理哪批、想合并哪些就合并哪些。每批采完先**轻检查**（01/02/03，只报告、软标记坏集、**绝不删数据**）→ 你**显式指定**的若干批次**合并**成一个集（自动排除坏集）→ 合并后统一标注/清洗 → **转 v3.0**（v2.1 自动备份 `<名字>_old`）→ **07 校验**（结构 smoke + sha256）→ **08 打包**（tar.gz 交付）→ 训练机核验后直训。
 
 - **输入布局**：标准 v2.1（`meta/` + `data/chunk-*/episode_*.parquet` + `videos/chunk-*/<cam>/*.mp4`）；转换后的 v3.0 同可被 01/02/03/标注/登记处理。
 - **合并（05）**：勾选 ≥2 个 v2.1 批次；自动按各批清洗清单（`<批>_products/clean/episode_disposition.csv`，兼容旧 `<批>_clean/`）排除坏集；机型/帧率/features 不一致会拒绝；输出自动命名 `{task}_{robot}_{MMDD[-MMDD]}_{N}cam_v{ver}`，已存在会拦截（`--overwrite` 覆盖）。
@@ -74,7 +77,7 @@ python3 web/app.py                   # 本地 Web：默认 http://127.0.0.1:8000
 
 | 功能 | 需要 | 说明 |
 |---|---|---|
-| 01/02/03/05/合并/登记/台账 | Python 3.10+ 核心包（numpy/pandas/pyarrow/PyYAML） | setup.sh 自动装，**开箱即用** |
+| 01/02/03/05/07/08/合并/登记/台账 | Python 3.10+ 核心包（numpy/pandas/pyarrow/PyYAML） | setup.sh 自动装，**开箱即用**（07/08 只用标准库 tarfile/hashlib + pyarrow 页脚） |
 | 视频帧数核对（01/03） | 系统 `ffprobe` | `sudo apt install ffmpeg`（Ubuntu）；setup.sh 只检查提示、不替你装；缺则该项自动跳过 + `[WARN]` |
 | 03 `--blur` 模糊检查 | opencv | setup.sh 可选行自动尝试装 |
 | 06 转换 v2.1→v3.0 | **lerobot 环境** | **只用采集机能跑**（conda `lerobot_arx_sdk311`）；其他机器会明确报错提示 |
@@ -92,7 +95,7 @@ innov-dataprep/
 │   ├── lib/                    # dataset_io(识别/摘要/产物布局) video_utils(ffprobe)
 │   │                           # report suggest(VLM引擎) replay(回放)
 │   ├── 01_inspect.py 02_timestamps.py 03_clean.py   # 轻检查（只读）
-│   ├── 05_merge.py 06_convert.py 09_annotate.py
+│   ├── 05_merge.py 06_convert.py 07_verify.py 08_pack.py 09_annotate.py
 │   └── migrate_products.py     # 旧平铺产物 → _products/ 一次性迁移
 ├── web/                        # Flask 本地界面（app.py 入口 + backend.py API）
 ├── ledger/record.py aggregate.py   # 登记卡 / 台账汇总
@@ -113,9 +116,9 @@ python3 tools/check_config.py        # 配置体检
 
 - [x] 01/02/03 轻检查（v2.1+v3.0，只读软标记）· 05 合并 · 06 转换（官方转换器）
 - [x] 09 标注（VLM，config 门禁）· Web 界面（回放/盲审/台账/一键动作）
+- [x] 07 校验（结构 smoke + 数据集/交付包 sha256，`--delivery` 整包核验）· 08 打包（tar.gz + sha256sums.txt）
 - [x] 登记 + 台账汇总 + 操作留痕 · 产物布局统一（_products/ + 迁移脚本）
-- [ ] 07 校验（v3.0 加载 smoke + 交付 sha256）
-- [ ] 08 打包传输（tar + sha256sums.txt）
+- [x] **全流程已实现**（01→08 闭环；只剩真实数据上的阈值定标与端到端验证）
 
 ## 9. License
 

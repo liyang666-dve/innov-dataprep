@@ -31,8 +31,9 @@ sys.path.insert(0, str(ROOT))
 from pipe.lib import dataset_io  # noqa: E402
 from pipe.lib import suggest as _suggest  # noqa: E402  # 仅用于 annotate 的无端点拦截
 
-STEPS = ["inspect", "timestamps", "clean", "merge", "convert", "record", "annotate"]  # 已实现
-PENDING = ["verify", "pack"]                                                          # 规划中（07-08）
+STEPS = ["inspect", "timestamps", "clean", "merge", "convert", "verify", "pack",
+         "record", "annotate"]  # 已实现
+PENDING: list[str] = []           # 规划中（已全部实现）
 
 ACTION_MENU = [
     ("inspect", "盘点(01) 每集统计/视频对齐"),
@@ -40,6 +41,8 @@ ACTION_MENU = [
     ("clean", "清洗质检(03) 软标记坏集"),
     ("merge", "合并(05) 勾选若干批次按坏集排除并成一份"),
     ("convert", "转换(06) v2.1→v3.0 官方转换器(自动留 v2.1 备份)"),
+    ("verify", "校验(07) 结构smoke + 交付sha256清单"),
+    ("pack", "打包(08) tar.gz + sha256sums.txt 交付训练机"),
     ("record", "登记 处理达标后入台账"),
     ("annotate", "标注(09) VLM 逐集质量评分+建议"),
     ("aggregate", "汇总台账"),
@@ -52,6 +55,8 @@ SCRIPTS = {
     "clean": "pipe/03_clean.py",
     "merge": "pipe/05_merge.py",
     "convert": "pipe/06_convert.py",
+    "verify": "pipe/07_verify.py",
+    "pack": "pipe/08_pack.py",
     "record": "ledger/record.py",
     "aggregate": "ledger/aggregate.py",
     "annotate": "pipe/09_annotate.py",
@@ -167,7 +172,8 @@ def mark(st: dict, path: str, step: str) -> None:
 def fmt_row(idx: int, info: dict, st: dict) -> str:
     key = info["path"]
     s = st.get(key, {})
-    status = "  ".join(f"{n}✓" for n in ("inspect", "timestamps", "clean", "merge", "convert", "record") if s.get(n))
+    status = "  ".join(f"{n}✓" for n in ("inspect", "timestamps", "clean", "merge", "convert",
+                                          "verify", "pack", "record", "annotate") if s.get(n))
     if info["kind"] == "not_dataset":
         return f"  [{idx}] {info['name']:<34} — 不可用: {info['reason']}"
     tag = {"v2.1": "v2.1", "v3.0": "v3.0"}.get(info["kind"], info["kind"])
@@ -244,6 +250,19 @@ def build_action_argv(action: str, allowed: list[dict], cfg: dict, opts: dict | 
         if (ROOT / "config.yaml").is_file():
             argv += ["--config", str(ROOT / "config.yaml")]
         return argv
+    if action == "verify":
+        argv = []
+        for info in allowed:
+            argv += ["--input", info["path"]]
+        return argv
+    if action == "pack":
+        argv = ["--input", allowed[0]["path"]]
+        out_root = cfg.get("paths", {}).get("output")
+        if out_root:
+            argv += ["--out", str(Path(out_root).expanduser())]
+        if opts.get("overwrite"):
+            argv += ["--overwrite"]
+        return argv
     # inspect / timestamps / clean
     argv = []
     for info in allowed:
@@ -272,6 +291,9 @@ def execute_action(action: str, allowed: list[dict], cfg: dict, st: dict,
     if action == "record" and len(allowed) != 1:
         say("[!] 登记一次只处理一个批次，请重新选择")
         return 1
+    if action == "pack" and len(allowed) != 1:
+        say("[!] 打包一次只处理一个数据集")
+        return 1
     if action == "annotate":
         _ac = _suggest.annotate_config(cfg)
         if not _ac["ok"]:
@@ -280,11 +302,14 @@ def execute_action(action: str, allowed: list[dict], cfg: dict, st: dict,
     argv = build_action_argv(action, allowed, cfg, opts)
     rc = run_script(SCRIPTS[action], argv, out_stream=say)
     if rc == 0:
-        for info in allowed:
-            mark(st, info["path"], action)
-            note = opts.get("stage") or "" if action == "record" else ""
-            record_op(state_f, info, action, note=note)
-        save_state(state_f, st)
+        try:
+            for info in allowed:
+                mark(st, info["path"], action)
+                note = opts.get("stage") or "" if action == "record" else ""
+                record_op(state_f, info, action, note=note)
+            save_state(state_f, st)
+        except OSError as e:
+            say(f"[WARN] 动作成功但状态/留痕写入失败（{e}），不影响数据本身")
     return rc
 
 
@@ -313,7 +338,7 @@ def action_kind_hint(action: str, info: dict) -> str | None:
     """返回该批次执行该动作被挡住的原因；None=允许。自由编排：任意批次都可选中，
     但版本不满足的动作给出明确提示，不静默跳过、也不用 0 集误导。"""
     kind = info.get("kind")
-    if action in ("inspect", "timestamps", "clean", "record", "annotate"):
+    if action in ("inspect", "timestamps", "clean", "record", "annotate", "verify", "pack"):
         return None if kind in ("v2.1", "v3.0") else "该步骤需要 v2.1/v3.0 数据集（exclude 软标记，不删源）"
     if action == "convert":
         if kind == "v3.0":
@@ -399,6 +424,9 @@ def do_action(action: str, selected: list[dict], cfg: dict, args: argparse.Names
                 ans = ""
             stage = "raw" if ans == "2" else "final"
         opts["stage"] = stage or "final"
+    if action == "pack":
+        if args.overwrite:
+            opts["overwrite"] = True
     return execute_action(action, selected, cfg, st, state_f, opts)
 
 
@@ -450,12 +478,13 @@ def cmd_list(cfg: dict, args: argparse.Namespace, st: dict) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(prog="run.py", description="innov-dataprep 总入口")
     ap.add_argument("cmd", nargs="?", default="menu",
-                    help="list / inspect / timestamps / clean / merge / convert / record / aggregate；空=交互菜单")
+                    help="list / inspect / timestamps / clean / merge / convert / verify / pack / record / annotate / aggregate；空=交互菜单")
     ap.add_argument("indices", nargs="*", help="数据编号（list 里看到的），如 1,3")
     ap.add_argument("--path", default=None, help="扫描哪个目录（默认 config paths.batches）")
     ap.add_argument("--dirs", nargs="+", default=None, help="直接给数据集路径，跳过扫描")
     ap.add_argument("--stage", choices=["final", "raw"], default=None, help="record 阶段")
     ap.add_argument("--output", default=None, help="合并输出目录（merge 用，默认自动命名）")
+    ap.add_argument("--overwrite", action="store_true", help="覆盖已存在的输出（merge/pack 用）")
     ap.add_argument("--yes", action="store_true", help="非交互场景自动确认（convert/record 用）")
     ap.add_argument("--aggregate-dir", default=None, help="汇总台账所在目录")
     ap.add_argument("--state", default=None, help="状态文件路径")
@@ -481,11 +510,11 @@ def main() -> int:
             except (EOFError, KeyboardInterrupt):
                 print("\n再见。")
                 return 0
-            if choice in ("8", "quit", "q", ""):
+            if choice in ("quit", "q", ""):
                 print("再见。")
                 return 0
             if not choice.isdigit() or not (1 <= int(choice) <= len(ACTION_MENU)):
-                print("[!] 请输入菜单编号 1-8")
+                print(f"[!] 请输入菜单编号 1-{len(ACTION_MENU)}（输入 q 退出）")
                 continue
             action = ACTION_MENU[int(choice) - 1][0]
             if action in PENDING:
@@ -504,7 +533,7 @@ def main() -> int:
     if args.cmd == "list":
         return cmd_list(cfg, args, st)
     if args.cmd not in SCRIPTS:
-        print(f"[ERROR] 未知命令: {args.cmd}（可用: list / inspect / timestamps / clean / merge / convert / record / aggregate）")
+        print(f"[ERROR] 未知命令: {args.cmd}（可用: list / inspect / timestamps / clean / merge / convert / verify / pack / record / annotate / aggregate）")
         return 2
     return cmd_clean(cfg, args, state_f, st)
 
