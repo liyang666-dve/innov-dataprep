@@ -88,7 +88,14 @@ def batches_roots(cfg: dict) -> list[Path]:
         roots.append(DEFAULT_BATCHES)
     if not roots:
         roots.append(ROOT)
-    return roots
+    uniq: list[Path] = []
+    seen: set[str] = set()
+    for p in roots:
+        key = str(Path(p).resolve())
+        if key not in seen:
+            seen.add(key)
+            uniq.append(Path(p))
+    return uniq
 
 
 def ledger_path(cfg: dict) -> Path:
@@ -97,11 +104,38 @@ def ledger_path(cfg: dict) -> Path:
 
 
 # ---------------------------------------------------------------- 扫描
+SCAN_EXTRA = ROOT / ".scan_extra.txt"   # 用户手动添加的扫描目录（每行一个，gitignore）
+
+
+def load_extra_dirs() -> list[str]:
+    """读取用户手动添加的扫描目录。"""
+    if not SCAN_EXTRA.is_file():
+        return []
+    out = []
+    for line in SCAN_EXTRA.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(line)
+    return out
+
+
+def save_extra_dirs(dirs: list[str]) -> None:
+    SCAN_EXTRA.write_text("\n".join(dirs) + ("\n" if dirs else ""), encoding="utf-8")
+
+
 def _read_info(ds: Path) -> dict:
     try:
         return json.loads((ds / "meta" / "info.json").read_text(encoding="utf-8"))
     except Exception:
         return {}
+
+
+def _same_dir(a: str, b: str) -> bool:
+    """路径归一后比较（用于移除扫描目录时宽容匹配）。"""
+    try:
+        return Path(a or "").expanduser().resolve() == Path(b or "").expanduser().resolve()
+    except Exception:
+        return (a or "").strip().strip("\"'") == (b or "").strip().strip("\"'")
 
 
 def _stage_file(ds: Path, stage: str, name: str) -> bool:
@@ -174,7 +208,8 @@ def scan_candidates(cfg: dict) -> list[dict]:
             },
         })
 
-    for root in batches_roots(cfg):
+    roots = batches_roots(cfg) + [Path(x) for x in load_extra_dirs()]
+    for root in roots:
         root = Path(root)
         if not root.is_dir():
             continue
@@ -285,6 +320,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json({"ok": True, "count": len(cands),
                                    "items": cands,
                                    "ledger": str(ledger_path(self.cfg))})
+            if api == "scandirs":
+                return self._json({"ok": True, "dirs": load_extra_dirs(),
+                                   "base": [str(p) for p in batches_roots(self.cfg)]})
             return self._json({"ok": False, "error": f"未知 API {api}"}, 404)
         if self.path in ("/", "/index.html"):
             self.send_response(302)
@@ -293,19 +331,46 @@ class Handler(SimpleHTTPRequestHandler):
             return
         return super().do_GET()
 
-    def do_POST(self):  # noqa: N802
-        if not self.path.startswith("/api/run"):
-            return self._json({"ok": False, "error": "仅支持 /api/run"}, 404)
+    def _read_body(self) -> dict:
         try:
             n = int(self.headers.get("Content-Length", 0))
-            body = json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+            return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
         except Exception:
-            return self._json({"ok": False, "error": "请求体不是 JSON"}, 400)
-        tool, target = body.get("tool", ""), body.get("target", "")
-        if not tool or not target:
-            return self._json({"ok": False, "error": "缺 tool/target"}, 400)
-        res = run_tool(tool, target, self.cfg, self.engine_py)
-        return self._json(res)
+            return {}
+
+    def _norm_dir(self, raw: str) -> Path | None:
+        """展开 ~ / 去引号；必须是已存在目录。"""
+        raw = (raw or "").strip().strip("\"'")
+        if not raw:
+            return None
+        p = Path(raw).expanduser().resolve()
+        return p if p.is_dir() else None
+
+    def do_POST(self):  # noqa: N802
+        if self.path.startswith("/api/run"):
+            body = self._read_body()
+            tool, target = body.get("tool", ""), body.get("target", "")
+            if not tool or not target:
+                return self._json({"ok": False, "error": "缺 tool/target"}, 400)
+            return self._json(run_tool(tool, target, self.cfg, self.engine_py))
+        if self.path.startswith("/api/scandirs"):
+            body = self._read_body()
+            raw = body.get("dir", "")
+            if body.get("remove"):
+                dirs = load_extra_dirs()
+                out = [d for d in dirs if not _same_dir(d, raw)]
+                save_extra_dirs(out)
+                return self._json({"ok": True, "dirs": out})
+            p = self._norm_dir(raw)
+            if p is None:
+                return self._json({"ok": False, "error": f"目录不存在：{raw}"}, 400)
+            dirs = load_extra_dirs()
+            key = str(p)
+            if key not in dirs:
+                dirs.append(key)
+                save_extra_dirs(dirs)
+            return self._json({"ok": True, "dirs": dirs})
+        return self._json({"ok": False, "error": "仅支持 /api/run、/api/scandirs"}, 404)
 
 
 def open_window(url: str) -> None:
