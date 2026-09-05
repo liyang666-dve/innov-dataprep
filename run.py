@@ -32,7 +32,7 @@ from pipe.lib import dataset_io  # noqa: E402
 from pipe.lib import suggest as _suggest  # noqa: E402  # 仅用于 annotate 的无端点拦截
 
 STEPS = ["inspect", "timestamps", "clean", "merge", "convert", "verify", "pack",
-         "record", "annotate"]  # 已实现
+         "record", "annotate", "hand_remove"]  # 已实现
 PENDING: list[str] = []           # 规划中（已全部实现）
 
 ACTION_MENU = [
@@ -45,6 +45,7 @@ ACTION_MENU = [
     ("pack", "打包(08) tar.gz + sha256sums.txt 交付训练机"),
     ("record", "登记 处理达标后入台账"),
     ("annotate", "标注(09) VLM 逐集质量评分+建议"),
+    ("hand_remove", "去手(10) 抹掉画面人手/手臂 → 输出 _nohand 副本(轻档盖板)"),
     ("aggregate", "汇总台账"),
     ("quit", "退出"),
 ]
@@ -60,6 +61,7 @@ SCRIPTS = {
     "record": "ledger/record.py",
     "aggregate": "ledger/aggregate.py",
     "annotate": "pipe/09_annotate.py",
+    "hand_remove": "pipe/10_hand_remove.py",
 }
 
 
@@ -173,7 +175,7 @@ def fmt_row(idx: int, info: dict, st: dict) -> str:
     key = info["path"]
     s = st.get(key, {})
     status = "  ".join(f"{n}✓" for n in ("inspect", "timestamps", "clean", "merge", "convert",
-                                          "verify", "pack", "record", "annotate") if s.get(n))
+                                          "verify", "pack", "record", "annotate", "hand_remove") if s.get(n))
     if info["kind"] == "not_dataset":
         return f"  [{idx}] {info['name']:<34} — 不可用: {info['reason']}"
     tag = {"v2.1": "v2.1", "v3.0": "v3.0"}.get(info["kind"], info["kind"])
@@ -263,10 +265,14 @@ def build_action_argv(action: str, allowed: list[dict], cfg: dict, opts: dict | 
         if opts.get("overwrite"):
             argv += ["--overwrite"]
         return argv
-    # inspect / timestamps / clean
+    # inspect / timestamps / clean / hand_remove
     argv = []
     for info in allowed:
         argv += ["--input", info["path"]]
+    if action == "hand_remove":
+        argv += ["--mode", opts.get("mode") or "blur"]
+        if opts.get("force_test"):
+            argv += ["--force-test-hand"]
     return argv
 
 
@@ -338,7 +344,8 @@ def action_kind_hint(action: str, info: dict) -> str | None:
     """返回该批次执行该动作被挡住的原因；None=允许。自由编排：任意批次都可选中，
     但版本不满足的动作给出明确提示，不静默跳过、也不用 0 集误导。"""
     kind = info.get("kind")
-    if action in ("inspect", "timestamps", "clean", "record", "annotate", "verify", "pack"):
+    if action in ("inspect", "timestamps", "clean", "record", "annotate", "verify", "pack",
+                  "hand_remove"):
         return None if kind in ("v2.1", "v3.0") else "该步骤需要 v2.1/v3.0 数据集（exclude 软标记，不删源）"
     if action == "convert":
         if kind == "v3.0":
@@ -424,6 +431,10 @@ def do_action(action: str, selected: list[dict], cfg: dict, args: argparse.Names
                 ans = ""
             stage = "raw" if ans == "2" else "final"
         opts["stage"] = stage or "final"
+    elif action == "hand_remove":
+        opts["mode"] = args.mode or "blur"
+        if args.force_test_hand:
+            opts["force_test"] = True
     if action == "pack":
         if args.overwrite:
             opts["overwrite"] = True
@@ -486,6 +497,10 @@ def main() -> int:
     ap.add_argument("--output", default=None, help="合并输出目录（merge 用，默认自动命名）")
     ap.add_argument("--overwrite", action="store_true", help="覆盖已存在的输出（merge/pack 用）")
     ap.add_argument("--yes", action="store_true", help="非交互场景自动确认（convert/record 用）")
+    ap.add_argument("--mode", choices=["blur", "dark"], default=None,
+                    help="去手盖板方式（hand_remove 用，默认 blur 模糊）")
+    ap.add_argument("--force-test-hand", action="store_true", dest="force_test_hand",
+                    help="去手开发自测：无真实手也强制注入遮罩验证链路")
     ap.add_argument("--aggregate-dir", default=None, help="汇总台账所在目录")
     ap.add_argument("--state", default=None, help="状态文件路径")
     args = ap.parse_args()
