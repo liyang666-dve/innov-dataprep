@@ -305,6 +305,84 @@ def find_episode_video(ds: Path, ep: int, cam: str) -> Path | None:
     return None
 
 
+FRAME_SCRIPT = r"""
+import os, json, cv2
+src = os.environ["WB_VID"]; out = os.environ["WB_OUT"]
+cap = cv2.VideoCapture(src)
+total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+step = 5
+if total > 300: step = max(5, round(total / 60))
+n = 0
+i = 0
+while True:
+    ok, fr = cap.read()
+    if not ok: break
+    if i % step == 0:
+        ok2, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ok2:
+            with open(os.path.join(out, f"{n:03d}.jpg"), "wb") as fh:
+                fh.write(buf.tobytes())
+        n += 1
+        if n >= 90: break
+    i += 1
+cap.release()
+print(json.dumps({"count": n, "step": step, "total": total}))
+"""
+
+
+def extract_frames(engine_py: str, ds_path: str, ep: int, cam: str) -> dict:
+    """抽帧预览：调 engine Python（带 cv2）把单集视频抽帧成 JPEG 缓存。
+    返回 {ok, token, count, step, total}；token 供 /api/review/frameimg 取图。"""
+    import hashlib  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    try:
+        ds = Path(ds_path).resolve()
+        f = find_episode_video(ds, ep, cam)
+    except Exception:
+        f = None
+    if f is None:
+        return {"ok": False, "error": f"未找到 ep{ep} {cam} 视频"}
+    token = hashlib.md5(str(f).encode("utf-8")).hexdigest()[:12]
+    outdir = ROOT / ".frame_cache" / token
+    try:
+        shutil.rmtree(outdir, ignore_errors=True)
+        outdir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {"ok": False, "error": f"缓存目录不可写：{e}"}
+    env = dict(os.environ)
+    env["WB_VID"] = str(f)
+    env["WB_OUT"] = str(outdir)
+    try:
+        r = subprocess.run([engine_py, "-c", FRAME_SCRIPT], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=300, env=env, cwd=str(ROOT))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"抽帧进程启动失败：{e}"}
+    if r.returncode != 0:
+        return {"ok": False, "error": "抽帧失败：" + (r.stderr or r.stdout or "")[-300:]}
+    try:
+        meta = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        meta = {"count": 0, "step": 5, "total": 0}
+    if meta.get("count", 0) == 0:
+        return {"ok": False, "error": "视频解码后无帧（可能已损坏）"}
+    return {"ok": True, "token": token, "count": meta["count"],
+            "step": meta["step"], "total": meta["total"]}
+
+
+def frame_image(token: str, i: int) -> tuple[bytes, str] | None:
+    """取缓存的第 i 张 JPEG。返回 (bytes, content_type)；无则 None。"""
+    try:
+        i = max(0, int(i))
+        p = ROOT / ".frame_cache" / str(token)[:64] / f"{i:03d}.jpg"
+        if not p.is_file():
+            return None
+        data = p.read_bytes()
+        return data, "image/jpeg"
+    except Exception:
+        return None
+
+
 def pick_dir_native() -> dict:
     """弹 Windows 原生『选择文件夹』对话框（tkinter filedialog，后台 pythonw 也能弹）。
     返回 {ok, path}；用户取消返回 {ok:false, cancelled:true}。"""
@@ -581,6 +659,35 @@ class Handler(SimpleHTTPRequestHandler):
                 if f is None:
                     return self._json({"ok": False, "error": f"未找到 ep{ep} {cam} 视频"}, 404)
                 return self._serve_mp4(f)
+            if api == "review/frames":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("path") or [""])[0]
+                ep_raw = (qs.get("ep") or ["0"])[0]
+                ep = int(ep_raw) if ep_raw.isdigit() else -1
+                cam = (qs.get("cam") or [""])[0]
+                if not tgt or ep < 0:
+                    return self._json({"ok": False, "error": "缺 path/ep"}, 400)
+                return self._json(extract_frames(self.engine_py, tgt, ep, cam))
+            if api == "review/frameimg":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tok = (qs.get("cache") or [""])[0]
+                ir = (qs.get("i") or ["0"])[0]
+                got = frame_image(tok, int(ir) if ir.isdigit() else 0) if tok else None
+                if got is None:
+                    return self._json({"ok": False, "error": "帧不存在（先调 /api/review/frames）"}, 404)
+                data, ctype = got
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "max-age=600")
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
             return self._json({"ok": False, "error": f"未知 API {api}"}, 404)
         if self.path in ("/", "/index.html"):
             self.send_response(302)
