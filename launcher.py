@@ -244,6 +244,67 @@ def disposition_rows(target: str) -> dict:
         return {"ok": False, "error": f"解析失败：{e}"}
 
 
+def review_meta(target: str) -> dict:
+    """视频复核数据：枚举数据集 videos/**/episode_*.mp4 → {cameras, episodes[]}，
+    附清洗结论（disposition 匹配）。纯标准库实现。"""
+    try:
+        ds = Path(target).resolve()
+    except Exception:
+        return {"ok": False, "error": "路径无效"}
+    if not ds.is_dir():
+        return {"ok": False, "error": "数据集不存在"}
+    eps: dict[int, dict] = {}
+    cams: set[str] = set()
+    vroot = ds / "videos"
+    if vroot.is_dir():
+        for f in vroot.rglob("episode_*.mp4"):
+            m = f.name.replace("episode_", "").replace(".mp4", "")
+            if not m.isdigit():
+                continue
+            ep = int(m)
+            cam = f.parent.name  # videos/<chunk>/<camera>/episode_*.mp4
+            cams.add(cam)
+            eps.setdefault(ep, {"cameras": []})
+            eps[ep]["cameras"].append(cam)
+    if not eps:
+        return {"ok": False, "error": "该数据集没有分集视频（videos/**/episode_*.mp4）"}
+    # 清洗结论
+    verdicts: dict[str, str] = {}
+    reasons: dict[str, str] = {}
+    disp = disposition_rows(str(ds))
+    if disp.get("ok"):
+        for r in disp["rows"]:
+            e = str(r.get("episode", "")).strip()
+            verdicts[e] = r.get("verdict", "")
+            rx = (r.get("reasons_exclude") or "").strip()
+            if rx and rx != "-":
+                reasons[e] = rx
+    out = []
+    for ep in sorted(eps):
+        v = verdicts.get(str(ep), "")
+        out.append({"episode": ep, "verdict": v or "none",
+                    "reasons": reasons.get(str(ep), ""),
+                    "cameras": sorted(set(eps[ep]["cameras"]))})
+    return {"ok": True, "name": ds.name, "episodes": out,
+            "cameras": sorted(cams)}
+
+
+def find_episode_video(ds: Path, ep: int, cam: str) -> Path | None:
+    """定位 videos/**/<cam>/episode_%06d.mp4。"""
+    vroot = ds / "videos"
+    if not vroot.is_dir():
+        return None
+    want = f"episode_{int(ep):06d}.mp4"
+    for f in vroot.rglob(want):
+        if f.parent.name == cam:
+            return f
+    # 兼容 cam 传了长名（observation.images.xxx）而目录只有短名
+    for f in vroot.rglob(want):
+        if cam and cam.split(".")[-1] in f.parent.name:
+            return f
+    return None
+
+
 def pick_dir_native() -> dict:
     """弹 Windows 原生『选择文件夹』对话框（tkinter filedialog，后台 pythonw 也能弹）。
     返回 {ok, path}；用户取消返回 {ok:false, cancelled:true}。"""
@@ -497,6 +558,29 @@ class Handler(SimpleHTTPRequestHandler):
                 if not tgt:
                     return self._json({"ok": False, "error": "缺 target"}, 400)
                 return self._json(disposition_rows(tgt))
+            if api == "review/episodes":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("path") or [""])[0]
+                if not tgt:
+                    return self._json({"ok": False, "error": "缺 path"}, 400)
+                return self._json(review_meta(tgt))
+            if api == "review/video":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("path") or [""])[0]
+                ep_raw = (qs.get("ep") or ["0"])[0]
+                ep = int(ep_raw) if ep_raw.isdigit() else -1
+                cam = (qs.get("cam") or [""])[0]
+                if not tgt or ep < 0:
+                    return self._json({"ok": False, "error": "缺 path/ep"}, 400)
+                try:
+                    f = find_episode_video(Path(tgt).resolve(), ep, cam)
+                except Exception:
+                    f = None
+                if f is None:
+                    return self._json({"ok": False, "error": f"未找到 ep{ep} {cam} 视频"}, 404)
+                return self._serve_mp4(f)
             return self._json({"ok": False, "error": f"未知 API {api}"}, 404)
         if self.path in ("/", "/index.html"):
             self.send_response(302)
@@ -504,6 +588,51 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             return
         return super().do_GET()
+
+    def _serve_mp4(self, f: Path):
+        """流式返回 mp4，支持 Range（206 分段）——浏览器 <video> 拖动进度条必需。"""
+        try:
+            size = f.stat().st_size
+            if size <= 0:
+                raise OSError
+            start, end = 0, size - 1
+            code = 200
+            rng = self.headers.get("Range")
+            if rng and rng.startswith("bytes="):
+                try:
+                    spec = rng[6:].split("-")
+                    s0 = int(spec[0]) if spec[0] else 0
+                    s1 = int(spec[1]) if len(spec) > 1 and spec[1] else size - 1
+                    if s0 >= size:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    start, end = s0, min(s1, size - 1)
+                    code = 206
+                except ValueError:
+                    pass
+            self.send_response(code)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.end_headers()
+            with open(f, "rb") as fh:
+                fh.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = fh.read(min(65536, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except Exception as e:  # noqa: BLE001
+            try:
+                self.send_response(404)
+                self.end_headers()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _read_body(self) -> dict:
         try:
