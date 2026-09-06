@@ -481,17 +481,22 @@ def main() -> int:
             open_window(running)
         return 0
 
-    # 端口被占（非 launcher 的其他程序）→ 自动递增找空闲端口
+    # 端口被占 → 先短等重试原端口（杀进程后 TIME_WAIT 需几秒释放，避免端口漂移），
+    # 仍失败再自动递增找空闲端口
     httpd = None
     port = args.port
-    for _ in range(50):
+    for attempt in range(6):
         try:
             httpd = DeskServer(("127.0.0.1", port), Handler)
             break
         except OSError:
+            if attempt == 0:
+                import time  # noqa: PLC0415
+                time.sleep(4)
+                continue
             port += 1
     if httpd is None:
-        print(f"[!] 端口 {args.port}-{args.port + 49} 均被占用，请先关闭残留进程")
+        print(f"[!] 端口 {args.port}-{args.port + 5} 均被占用，请先关闭残留进程")
         return 3
     if port != args.port:
         print(f"[i] 端口 {args.port} 被占用，已改用 {port}")
