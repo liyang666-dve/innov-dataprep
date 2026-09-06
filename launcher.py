@@ -152,6 +152,45 @@ def _has_pack(ds: Path) -> bool:
     return any(p.name.endswith("_delivery.tar.gz") for p in d.glob("*"))
 
 
+def _updated_ts(ds: Path) -> float:
+    """数据集/产物目录最近改动时间戳（资产树显示"x 分钟前"）。"""
+    ts = ds.stat().st_mtime
+    prod = ds.parent / f"{ds.name}_products"
+    try:
+        if prod.is_dir():
+            ts = max(ts, prod.stat().st_mtime)
+    except OSError:
+        pass
+    return round(ts, 1)
+
+
+def _quality_summary(ds: Path) -> dict:
+    """从 _products/{clean,verify} 读质量摘要：清洗排除数 / 校验警告数（None=未跑）。"""
+    q: dict = {"excluded": None, "warnings": None, "verify_ok": None}
+    clean_csv = (ds.parent / f"{ds.name}_products" / "clean" / "episode_disposition.csv")
+    if not clean_csv.is_file():
+        clean_csv = ds.parent / f"{ds.name}_clean" / "episode_disposition.csv"
+    if clean_csv.is_file():
+        try:
+            lines = clean_csv.read_text(encoding="utf-8", errors="replace").splitlines()[1:]
+            q["excluded"] = sum(1 for ln in lines if "exclude" in ln.lower())
+        except Exception:
+            pass
+    ver_json = ds.parent / f"{ds.name}_products" / "verify" / "verify_report.json"
+    if not ver_json.is_file():
+        ver_json = ds.parent / f"{ds.name}_verify" / "verify_report.json"
+    if ver_json.is_file():
+        try:
+            v = json.loads(ver_json.read_text(encoding="utf-8"))
+            q["warnings"] = v.get("n_warnings")
+            if q["warnings"] is None and isinstance(v.get("warnings"), list):
+                q["warnings"] = len(v["warnings"])
+            q["verify_ok"] = bool(v.get("ok", v.get("passed", None)))
+        except Exception:
+            pass
+    return q
+
+
 def scan_candidates(cfg: dict) -> list[dict]:
     """扫描产出候选：数据集（v2.1/v3.0）与 原始源（带 config.json + source_type）。"""
     out: list[dict] = []
@@ -175,6 +214,8 @@ def scan_candidates(cfg: dict) -> list[dict]:
             if st:
                 out.append({"kind": "raw", "name": d.name, "path": str(d),
                             "source_type": st, "task": c.get("task", ""),
+                            "n_demos": sum(1 for x in d.iterdir() if x.is_dir()),
+                            "updated_ts": _updated_ts(d),
                             "steps": {}})
             return
         if not (d / "data").is_dir():
@@ -200,6 +241,8 @@ def scan_candidates(cfg: dict) -> list[dict]:
             "robot": info.get("robot_type", "?"), "fps": info.get("fps"),
             "episodes": info.get("total_episodes"), "frames": frames,
             "cams": cam_feats, "task": d.name.split("_")[0] if not source_type else d.name,
+            "updated_ts": _updated_ts(d),
+            "quality": _quality_summary(d),
             "steps": {
                 "ingest": bool(source_type),
                 "clean": _stage_file(d, "clean", "episode_disposition.csv"),
@@ -256,6 +299,7 @@ def run_tool(tool: str, target: str, cfg: dict, engine_py: str) -> dict:
                  "--out", str(prods / "delivery")],
         "record": [ROOT / "ledger" / "record.py", "--batch", str(tgt), "--stage", "final",
                    "--yes", "--out", str(ledger_path(cfg))],
+        "dehand": [ROOT / "pipe" / "10_hand_remove.py", "--input", str(tgt)],
     }
     if tool not in scripts:
         return {"ok": False, "log": f"未知工具 {tool}"}
@@ -398,7 +442,7 @@ def _is_launcher(url: str) -> bool:
     """探测该地址是否已有本 launcher 在跑（app 名匹配），避免重复起服务。"""
     import urllib.request  # noqa: PLC0415
     try:
-        with urllib.request.urlopen(url + "api/hello", timeout=1.5) as r:
+        with urllib.request.urlopen(url + "api/hello", timeout=0.6) as r:
             data = json.loads(r.read().decode("utf-8") or "{}")
             return data.get("app") == "embodied-data-desk-launcher"
     except Exception:  # noqa: BLE001
@@ -406,8 +450,8 @@ def _is_launcher(url: str) -> bool:
 
 
 def find_running(port: int) -> str | None:
-    """从 port 起扫一段端口，返回已运行实例的 URL；没有返回 None。"""
-    for p in range(port, port + 50):
+    """从 port 起小范围探测（默认端口与相邻几个），已有实例则返回其 URL。"""
+    for p in range(port, port + 6):
         u = f"http://127.0.0.1:{p}/"
         if _is_launcher(u):
             return u
