@@ -212,6 +212,38 @@ def _clean_disposition_csv(ds: Path) -> Path | None:
     return p2 if p2.is_file() else None
 
 
+def ledger_rows(cfg: dict) -> dict:
+    """读台账 data_catalog.csv → {ok, file, rows:[{col:val}...]}（列动态，兼容 BOM）。"""
+    p = ledger_path(cfg)
+    if not p.is_file():
+        return {"ok": False, "error": f"台账不存在: {p}"}
+    try:
+        import csv  # noqa: PLC0415
+        with open(p, encoding="utf-8-sig", errors="replace", newline="") as f:
+            rows = list(csv.DictReader(f))
+        return {"ok": True, "file": str(p), "rows": rows}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"台账解析失败：{e}"}
+
+
+def disposition_rows(target: str) -> dict:
+    """读某数据集 episode_disposition.csv 全行（逐集 verdict/时长/原因/帧数等）。"""
+    try:
+        ds = Path(target).resolve()
+    except Exception:
+        return {"ok": False, "error": "路径无效"}
+    csv_f = _clean_disposition_csv(ds)
+    if csv_f is None:
+        return {"ok": False, "error": "还没有清洗产物（先运行清洗质检 03）"}
+    try:
+        import csv  # noqa: PLC0415
+        with open(csv_f, encoding="utf-8-sig", errors="replace", newline="") as f:
+            rows = list(csv.DictReader(f))
+        return {"ok": True, "dataset": ds.name, "rows": rows}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"解析失败：{e}"}
+
+
 def pick_dir_native() -> dict:
     """弹 Windows 原生『选择文件夹』对话框（tkinter filedialog，后台 pythonw 也能弹）。
     返回 {ok, path}；用户取消返回 {ok:false, cancelled:true}。"""
@@ -456,6 +488,15 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(qc_human(tgt))
             if api == "pickdir":
                 return self._json(pick_dir_native())
+            if api == "ledger":
+                return self._json(ledger_rows(self.cfg))
+            if api == "disposition":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("target") or [""])[0]
+                if not tgt:
+                    return self._json({"ok": False, "error": "缺 target"}, 400)
+                return self._json(disposition_rows(tgt))
             return self._json({"ok": False, "error": f"未知 API {api}"}, 404)
         if self.path in ("/", "/index.html"):
             self.send_response(302)
