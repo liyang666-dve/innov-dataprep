@@ -191,6 +191,65 @@ def _quality_summary(ds: Path) -> dict:
     return q
 
 
+# ---------------------------------------------------------------- 质量人话解读
+QC_ADVICE: list[tuple[str, str]] = [
+    ("限位", "像标定或极限位姿问题：核对零位与示教范围；若动作本身越界则该段数据对训练无益，建议直接删"),
+    ("跳变", "多为时间戳错位或信号毛刺/手抖：优先修时间戳后重采；仍跳则建议排除，避免教坏模型"),
+    ("卡死", "采集过程关节空转（长时间不动）：动作没动就没信息量，建议整段删；若传感器假死则要查采集链路"),
+    ("NaN", "动作通道有缺数：查采集写盘是否中断；少量可插值补，多处建议删该集"),
+    ("模糊", "画面模糊会伤视觉策略：优先补光/调快门重拍；比例很小可考虑只删模糊片段"),
+    ("视频", "视频与状态没对齐（缺帧/丢帧/结束不一致）：检查相机录制是否提前停，重录或删该集"),
+    ("时长", "时长异常（太短或超长）：太短无学习价值、超长多为误触发，建议人工复核后处置"),
+]
+QC_ADVICE_FALLBACK = "参看 qc_report.md 明细人工复核；拿不准就先排除，数据集宁缺毋滥"
+
+
+def _clean_disposition_csv(ds: Path) -> Path | None:
+    p = ds.parent / f"{ds.name}_products" / "clean" / "episode_disposition.csv"
+    if p.is_file():
+        return p
+    p2 = ds.parent / f"{ds.name}_clean" / "episode_disposition.csv"
+    return p2 if p2.is_file() else None
+
+
+def qc_human(target: str) -> dict:
+    """把 03 清洗的排除明细翻成"人话 + 处置建议"（供页面/对话展示）。"""
+    try:
+        ds = Path(target).resolve()
+    except Exception:
+        return {"ok": False, "error": "路径无效"}
+    csv = _clean_disposition_csv(ds)
+    if csv is None:
+        return {"ok": False, "error": "还没有清洗产物（先运行清洗质检 03）"}
+    items: list[dict] = []
+    n_total = 0
+    try:
+        lines = csv.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        header = lines[0].split(",") if lines else []
+        i_ex = header.index("reasons_exclude") if "reasons_exclude" in header else -1
+        i_vd = header.index("verdict") if "verdict" in header else 3
+        for ln in lines[1:]:
+            if not ln.strip():
+                continue
+            parts = ln.split(",")
+            n_total += 1
+            if i_vd >= len(parts) or "exclude" not in parts[i_vd].lower():
+                continue
+            reasons = (parts[i_ex] if 0 <= i_ex < len(parts) else "").split("|")
+            reasons = [r.strip() for r in reasons if r.strip()]
+            advice: list[str] = []
+            for r in reasons:
+                hit = next((a for kw, a in QC_ADVICE if kw in r), "")
+                advice.append(hit or QC_ADVICE_FALLBACK)
+            items.append({"ep": parts[0].strip(), "reasons": reasons, "advice": advice})
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"解析清洗产物失败：{e}"}
+    advice_all = "；".join(dict.fromkeys(a for it in items for a in it["advice"])) or \
+        "全部通过，无需处理"
+    return {"ok": True, "dataset": ds.name, "n_total": n_total,
+            "n_excluded": len(items), "items": items, "advice_all": advice_all}
+
+
 def scan_candidates(cfg: dict) -> list[dict]:
     """扫描产出候选：数据集（v2.1/v3.0）与 原始源（带 config.json + source_type）。"""
     out: list[dict] = []
@@ -367,6 +426,13 @@ class Handler(SimpleHTTPRequestHandler):
             if api == "scandirs":
                 return self._json({"ok": True, "dirs": load_extra_dirs(),
                                    "base": [str(p) for p in batches_roots(self.cfg)]})
+            if api == "qcmsg":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("target") or [""])[0]
+                if not tgt:
+                    return self._json({"ok": False, "error": "缺 target"}, 400)
+                return self._json(qc_human(tgt))
             return self._json({"ok": False, "error": f"未知 API {api}"}, 404)
         if self.path in ("/", "/index.html"):
             self.send_response(302)
