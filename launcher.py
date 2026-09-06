@@ -386,6 +386,34 @@ def open_window(url: str) -> None:
     webbrowser.open(url)
 
 
+class DeskServer(ThreadingHTTPServer):
+    """关闭 SO_REUSEADDR：Windows 上重复 bind 同一端口会"叠罗汉"式多实例监听，
+    浏览器请求随机落到旧实例 → 出现『新功能没有、报旧错误』的诡异问题。
+    置 False 后端口被占时 bind 直接失败，由 main 自动换到空闲端口。"""
+
+    allow_reuse_address = False
+
+
+def _is_launcher(url: str) -> bool:
+    """探测该地址是否已有本 launcher 在跑（app 名匹配），避免重复起服务。"""
+    import urllib.request  # noqa: PLC0415
+    try:
+        with urllib.request.urlopen(url + "api/hello", timeout=1.5) as r:
+            data = json.loads(r.read().decode("utf-8") or "{}")
+            return data.get("app") == "embodied-data-desk-launcher"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def find_running(port: int) -> str | None:
+    """从 port 起扫一段端口，返回已运行实例的 URL；没有返回 None。"""
+    for p in range(port, port + 50):
+        u = f"http://127.0.0.1:{p}/"
+        if _is_launcher(u):
+            return u
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=PORT)
@@ -401,8 +429,30 @@ def main() -> int:
         print(f"[!] 未找到工作台目录: {WORKSPACE}（launcher 应放在数据系统目录下两个仓库并列）")
         return 2
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
-    url = f"http://127.0.0.1:{args.port}/"
+    # 幂等：已有实例在跑 → 直接开它的窗口并退出，绝不重复起服务
+    running = find_running(args.port)
+    if running:
+        print(f"[launcher] 已有实例运行于 {running}，直接打开窗口（如需重启请先关闭旧窗口/进程）")
+        if not args.no_open:
+            open_window(running)
+        return 0
+
+    # 端口被占（非 launcher 的其他程序）→ 自动递增找空闲端口
+    httpd = None
+    port = args.port
+    for _ in range(50):
+        try:
+            httpd = DeskServer(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            port += 1
+    if httpd is None:
+        print(f"[!] 端口 {args.port}-{args.port + 49} 均被占用，请先关闭残留进程")
+        return 3
+    if port != args.port:
+        print(f"[i] 端口 {args.port} 被占用，已改用 {port}")
+
+    url = f"http://127.0.0.1:{port}/"
     print(f"[launcher] 数据处理台服务已启动: {url}")
     print(f"[launcher] 引擎 Python: {Handler.engine_py}")
     print(f"[launcher] 工作台: {WORKSPACE}")
