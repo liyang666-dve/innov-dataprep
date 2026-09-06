@@ -212,6 +212,27 @@ def _clean_disposition_csv(ds: Path) -> Path | None:
     return p2 if p2.is_file() else None
 
 
+def pick_dir_native() -> dict:
+    """弹 Windows 原生『选择文件夹』对话框（tkinter filedialog，后台 pythonw 也能弹）。
+    返回 {ok, path}；用户取消返回 {ok:false, cancelled:true}。"""
+    try:
+        import tkinter as tk  # noqa: PLC0415
+        from tkinter import filedialog  # noqa: PLC0415
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            path = filedialog.askdirectory(
+                title="选择要扫描的目录（放原始源或标准数据集的目录，可整个父目录）")
+        finally:
+            root.destroy()
+        if path:
+            return {"ok": True, "path": path.replace("/", "\\")}
+        return {"ok": False, "cancelled": True}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"无法弹出选择框：{e}"}
+
+
 def qc_human(target: str) -> dict:
     """把 03 清洗的排除明细翻成"人话 + 处置建议"（供页面/对话展示）。"""
     try:
@@ -433,6 +454,8 @@ class Handler(SimpleHTTPRequestHandler):
                 if not tgt:
                     return self._json({"ok": False, "error": "缺 target"}, 400)
                 return self._json(qc_human(tgt))
+            if api == "pickdir":
+                return self._json(pick_dir_native())
             return self._json({"ok": False, "error": f"未知 API {api}"}, 404)
         if self.path in ("/", "/index.html"):
             self.send_response(302)
