@@ -1,0 +1,889 @@
+#!/usr/bin/env python3
+"""数据处理台 桌面启动器 —— 零安装"软件"形态（仅标准库）。
+
+双击 start_desk.bat → 本脚本后台运行：
+  1) 起本地 HTTP 服务（127.0.0.1:PORT）：
+     - 静态托管工作台（数据系统目录，自动打开 embodied-data-workspace/index.html）
+     - /api/hello            引擎在线探测
+     - /api/batches          扫描批次/源（config paths.batches + ingest_demo）
+     - /api/run              {tool, target} 执行 INGEST / 01 / 03 / 07 / 08 / record
+  2) 自动用 Edge --app 打开独立应用窗口（无地址栏，观感=桌面软件）；
+     Edge 不存在时回退默认浏览器。
+
+依赖：仅 Python 标准库。引擎脚本（00_ingest/01..08/ledger）由 ENGINE_PY 指定的
+Python 执行（默认探测 D:/miniconda/envs/lerobot/python.exe，Linux 回退 python3）。
+
+用法:
+    pythonw launcher.py                 # 桌面模式（自动开 Edge 窗口）
+    python  launcher.py --no-open       # 只起服务不弹窗（调试）
+    python  launcher.py --port 8123 --engine-py /path/to/python
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import webbrowser
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+DATADIR = ROOT.parent                     # 数据系统目录（两个仓库并列）
+WORKSPACE = DATADIR / "embodied-workspace"
+DEFAULT_BATCHES = ROOT / "ingest_demo" / "datasets"
+LOG_MAX = 6000                            # /api/run 返回日志上限(字符)
+PORT = 8017
+
+ENGINE_CANDIDATES = [
+    os.environ.get("INNOV_PYTHON", ""),
+    "D:/miniconda/envs/lerobot/python.exe",
+    "D:/miniconda/envs/lerobot_arx_sdk311/python.exe",
+    sys.executable,
+]
+
+
+def find_engine_py() -> str:
+    for c in ENGINE_CANDIDATES:
+        if c and Path(c).is_file():
+            return c
+    return "python3"
+
+
+def load_config() -> dict:
+    """读 innov-dataprep/config.yaml；yaml 缺失时退化为逐行解析 paths。"""
+    cfg = {}
+    path = ROOT / "config.yaml"
+    if not path.is_file():
+        return cfg
+    try:
+        import yaml  # noqa: PLC0415
+        cfg = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if cfg.get("paths"):
+            return cfg
+    except Exception:
+        pass
+    # 轻量回退：只取 paths.batches / paths.ledger 两行
+    txt = path.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"^\s*batches:\s*['\"]?([^#'\"\s]+)", txt, re.M)
+    if m:
+        cfg.setdefault("paths", {})["batches"] = m.group(1)
+    m = re.search(r"^\s*ledger:\s*['\"]?([^#'\"\s]+)", txt, re.M)
+    if m:
+        cfg.setdefault("paths", {})["ledger"] = m.group(1)
+    return cfg
+
+
+def batches_roots(cfg: dict) -> list[Path]:
+    roots = []
+    b = (cfg.get("paths") or {}).get("batches")
+    if b:
+        roots.append(Path(b))
+    if DEFAULT_BATCHES.is_dir():
+        roots.append(DEFAULT_BATCHES)
+    if not roots:
+        roots.append(ROOT)
+    uniq: list[Path] = []
+    seen: set[str] = set()
+    for p in roots:
+        key = str(Path(p).resolve())
+        if key not in seen:
+            seen.add(key)
+            uniq.append(Path(p))
+    return uniq
+
+
+def ledger_path(cfg: dict) -> Path:
+    l = (cfg.get("paths") or {}).get("ledger")
+    return Path(l) if l else ROOT / "data_catalog.csv"
+
+
+# ---------------------------------------------------------------- 扫描
+SCAN_EXTRA = ROOT / ".scan_extra.txt"   # 用户手动添加的扫描目录（每行一个，gitignore）
+
+
+def load_extra_dirs() -> list[str]:
+    """读取用户手动添加的扫描目录。"""
+    if not SCAN_EXTRA.is_file():
+        return []
+    out = []
+    for line in SCAN_EXTRA.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(line)
+    return out
+
+
+def save_extra_dirs(dirs: list[str]) -> None:
+    SCAN_EXTRA.write_text("\n".join(dirs) + ("\n" if dirs else ""), encoding="utf-8")
+
+
+def _read_info(ds: Path) -> dict:
+    try:
+        return json.loads((ds / "meta" / "info.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _same_dir(a: str, b: str) -> bool:
+    """路径归一后比较（用于移除扫描目录时宽容匹配）。"""
+    try:
+        return Path(a or "").expanduser().resolve() == Path(b or "").expanduser().resolve()
+    except Exception:
+        return (a or "").strip().strip("\"'") == (b or "").strip().strip("\"'")
+
+
+def _stage_file(ds: Path, stage: str, name: str) -> bool:
+    """轻量版 dataset_io.stage_file：_products/{stage} 优先，回退旧平铺 _stage。"""
+    if (ds.parent / f"{ds.name}_products" / stage / name).is_file():
+        return True
+    return (ds.parent / f"{ds.name}_{stage}" / name).is_file()
+
+
+def _has_pack(ds: Path) -> bool:
+    d = ds.parent / f"{ds.name}_products" / "delivery"
+    if not d.is_dir():
+        return False
+    return any(p.name.endswith("_delivery.tar.gz") for p in d.glob("*"))
+
+
+def _updated_ts(ds: Path) -> float:
+    """数据集/产物目录最近改动时间戳（资产树显示"x 分钟前"）。"""
+    ts = ds.stat().st_mtime
+    prod = ds.parent / f"{ds.name}_products"
+    try:
+        if prod.is_dir():
+            ts = max(ts, prod.stat().st_mtime)
+    except OSError:
+        pass
+    return round(ts, 1)
+
+
+def _quality_summary(ds: Path) -> dict:
+    """从 _products/{clean,verify} 读质量摘要：清洗排除数 / 校验警告数（None=未跑）。"""
+    q: dict = {"excluded": None, "warnings": None, "verify_ok": None}
+    clean_csv = (ds.parent / f"{ds.name}_products" / "clean" / "episode_disposition.csv")
+    if not clean_csv.is_file():
+        clean_csv = ds.parent / f"{ds.name}_clean" / "episode_disposition.csv"
+    if clean_csv.is_file():
+        try:
+            lines = clean_csv.read_text(encoding="utf-8", errors="replace").splitlines()[1:]
+            q["excluded"] = sum(1 for ln in lines if "exclude" in ln.lower())
+        except Exception:
+            pass
+    ver_json = ds.parent / f"{ds.name}_products" / "verify" / "verify_report.json"
+    if not ver_json.is_file():
+        ver_json = ds.parent / f"{ds.name}_verify" / "verify_report.json"
+    if ver_json.is_file():
+        try:
+            v = json.loads(ver_json.read_text(encoding="utf-8"))
+            q["warnings"] = v.get("n_warnings")
+            if q["warnings"] is None and isinstance(v.get("warnings"), list):
+                q["warnings"] = len(v["warnings"])
+            q["verify_ok"] = bool(v.get("ok", v.get("passed", None)))
+        except Exception:
+            pass
+    return q
+
+
+# ---------------------------------------------------------------- 质量人话解读
+QC_ADVICE: list[tuple[str, str]] = [
+    ("限位", "像标定或极限位姿问题：核对零位与示教范围；若动作本身越界则该段数据对训练无益，建议直接删"),
+    ("跳变", "多为时间戳错位或信号毛刺/手抖：优先修时间戳后重采；仍跳则建议排除，避免教坏模型"),
+    ("卡死", "采集过程关节空转（长时间不动）：动作没动就没信息量，建议整段删；若传感器假死则要查采集链路"),
+    ("NaN", "动作通道有缺数：查采集写盘是否中断；少量可插值补，多处建议删该集"),
+    ("模糊", "画面模糊会伤视觉策略：优先补光/调快门重拍；比例很小可考虑只删模糊片段"),
+    ("视频", "视频与状态没对齐（缺帧/丢帧/结束不一致）：检查相机录制是否提前停，重录或删该集"),
+    ("时长", "时长异常（太短或超长）：太短无学习价值、超长多为误触发，建议人工复核后处置"),
+]
+QC_ADVICE_FALLBACK = "参看 qc_report.md 明细人工复核；拿不准就先排除，数据集宁缺毋滥"
+
+
+def _clean_disposition_csv(ds: Path) -> Path | None:
+    p = ds.parent / f"{ds.name}_products" / "clean" / "episode_disposition.csv"
+    if p.is_file():
+        return p
+    p2 = ds.parent / f"{ds.name}_clean" / "episode_disposition.csv"
+    return p2 if p2.is_file() else None
+
+
+def ledger_rows(cfg: dict) -> dict:
+    """读台账 data_catalog.csv → {ok, file, rows:[{col:val}...]}（列动态，兼容 BOM）。"""
+    p = ledger_path(cfg)
+    if not p.is_file():
+        return {"ok": False, "error": f"台账不存在: {p}"}
+    try:
+        import csv  # noqa: PLC0415
+        with open(p, encoding="utf-8-sig", errors="replace", newline="") as f:
+            rows = list(csv.DictReader(f))
+        return {"ok": True, "file": str(p), "rows": rows}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"台账解析失败：{e}"}
+
+
+def disposition_rows(target: str) -> dict:
+    """读某数据集 episode_disposition.csv 全行（逐集 verdict/时长/原因/帧数等）。"""
+    try:
+        ds = Path(target).resolve()
+    except Exception:
+        return {"ok": False, "error": "路径无效"}
+    csv_f = _clean_disposition_csv(ds)
+    if csv_f is None:
+        return {"ok": False, "error": "还没有清洗产物（先运行清洗质检 03）"}
+    try:
+        import csv  # noqa: PLC0415
+        with open(csv_f, encoding="utf-8-sig", errors="replace", newline="") as f:
+            rows = list(csv.DictReader(f))
+        return {"ok": True, "dataset": ds.name, "rows": rows}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"解析失败：{e}"}
+
+
+def review_meta(target: str) -> dict:
+    """视频复核数据：枚举数据集 videos/**/episode_*.mp4 → {cameras, episodes[]}，
+    附清洗结论（disposition 匹配）。纯标准库实现。"""
+    try:
+        ds = Path(target).resolve()
+    except Exception:
+        return {"ok": False, "error": "路径无效"}
+    if not ds.is_dir():
+        return {"ok": False, "error": "数据集不存在"}
+    eps: dict[int, dict] = {}
+    cams: set[str] = set()
+    vroot = ds / "videos"
+    if vroot.is_dir():
+        for f in vroot.rglob("episode_*.mp4"):
+            m = f.name.replace("episode_", "").replace(".mp4", "")
+            if not m.isdigit():
+                continue
+            ep = int(m)
+            cam = f.parent.name  # videos/<chunk>/<camera>/episode_*.mp4
+            cams.add(cam)
+            eps.setdefault(ep, {"cameras": []})
+            eps[ep]["cameras"].append(cam)
+    if not eps:
+        return {"ok": False, "error": "该数据集没有分集视频（videos/**/episode_*.mp4）"}
+    # 清洗结论
+    verdicts: dict[str, str] = {}
+    reasons: dict[str, str] = {}
+    disp = disposition_rows(str(ds))
+    if disp.get("ok"):
+        for r in disp["rows"]:
+            e = str(r.get("episode", "")).strip()
+            verdicts[e] = r.get("verdict", "")
+            rx = (r.get("reasons_exclude") or "").strip()
+            if rx and rx != "-":
+                reasons[e] = rx
+    out = []
+    for ep in sorted(eps):
+        v = verdicts.get(str(ep), "")
+        out.append({"episode": ep, "verdict": v or "none",
+                    "reasons": reasons.get(str(ep), ""),
+                    "cameras": sorted(set(eps[ep]["cameras"]))})
+    return {"ok": True, "name": ds.name, "episodes": out,
+            "cameras": sorted(cams)}
+
+
+def find_episode_video(ds: Path, ep: int, cam: str) -> Path | None:
+    """定位 videos/**/<cam>/episode_%06d.mp4。"""
+    vroot = ds / "videos"
+    if not vroot.is_dir():
+        return None
+    want = f"episode_{int(ep):06d}.mp4"
+    for f in vroot.rglob(want):
+        if f.parent.name == cam:
+            return f
+    # 兼容 cam 传了长名（observation.images.xxx）而目录只有短名
+    for f in vroot.rglob(want):
+        if cam and cam.split(".")[-1] in f.parent.name:
+            return f
+    return None
+
+
+FRAME_SCRIPT = r"""
+import os, json, cv2
+src = os.environ["WB_VID"]; out = os.environ["WB_OUT"]
+cap = cv2.VideoCapture(src)
+total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+step = 5
+if total > 300: step = max(5, round(total / 60))
+n = 0
+i = 0
+while True:
+    ok, fr = cap.read()
+    if not ok: break
+    if i % step == 0:
+        ok2, buf = cv2.imencode(".jpg", fr, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if ok2:
+            with open(os.path.join(out, f"{n:03d}.jpg"), "wb") as fh:
+                fh.write(buf.tobytes())
+        n += 1
+        if n >= 90: break
+    i += 1
+cap.release()
+print(json.dumps({"count": n, "step": step, "total": total}))
+"""
+
+
+def extract_frames(engine_py: str, ds_path: str, ep: int, cam: str) -> dict:
+    """抽帧预览：调 engine Python（带 cv2）把单集视频抽帧成 JPEG 缓存。
+    返回 {ok, token, count, step, total}；token 供 /api/review/frameimg 取图。"""
+    import hashlib  # noqa: PLC0415
+    import shutil  # noqa: PLC0415
+    try:
+        ds = Path(ds_path).resolve()
+        f = find_episode_video(ds, ep, cam)
+    except Exception:
+        f = None
+    if f is None:
+        return {"ok": False, "error": f"未找到 ep{ep} {cam} 视频"}
+    token = hashlib.md5(str(f).encode("utf-8")).hexdigest()[:12]
+    outdir = ROOT / ".frame_cache" / token
+    try:
+        shutil.rmtree(outdir, ignore_errors=True)
+        outdir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {"ok": False, "error": f"缓存目录不可写：{e}"}
+    env = dict(os.environ)
+    env["WB_VID"] = str(f)
+    env["WB_OUT"] = str(outdir)
+    try:
+        r = subprocess.run([engine_py, "-c", FRAME_SCRIPT], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=300, env=env, cwd=str(ROOT))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"抽帧进程启动失败：{e}"}
+    if r.returncode != 0:
+        return {"ok": False, "error": "抽帧失败：" + (r.stderr or r.stdout or "")[-300:]}
+    try:
+        meta = json.loads((r.stdout or "").strip().splitlines()[-1])
+    except Exception:
+        meta = {"count": 0, "step": 5, "total": 0}
+    if meta.get("count", 0) == 0:
+        return {"ok": False, "error": "视频解码后无帧（可能已损坏）"}
+    return {"ok": True, "token": token, "count": meta["count"],
+            "step": meta["step"], "total": meta["total"]}
+
+
+def frame_image(token: str, i: int) -> tuple[bytes, str] | None:
+    """取缓存的第 i 张 JPEG。返回 (bytes, content_type)；无则 None。"""
+    try:
+        i = max(0, int(i))
+        p = ROOT / ".frame_cache" / str(token)[:64] / f"{i:03d}.jpg"
+        if not p.is_file():
+            return None
+        data = p.read_bytes()
+        return data, "image/jpeg"
+    except Exception:
+        return None
+
+
+def pick_dir_native() -> dict:
+    """弹 Windows 原生『选择文件夹』对话框（tkinter filedialog，后台 pythonw 也能弹）。
+    返回 {ok, path}；用户取消返回 {ok:false, cancelled:true}。"""
+    try:
+        import tkinter as tk  # noqa: PLC0415
+        from tkinter import filedialog  # noqa: PLC0415
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        try:
+            path = filedialog.askdirectory(
+                title="选择要扫描的目录（放原始源或标准数据集的目录，可整个父目录）")
+        finally:
+            root.destroy()
+        if path:
+            return {"ok": True, "path": path.replace("/", "\\")}
+        return {"ok": False, "cancelled": True}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"无法弹出选择框：{e}"}
+
+
+def qc_human(target: str) -> dict:
+    """把 03 清洗的排除明细翻成"人话 + 处置建议"（供页面/对话展示）。"""
+    try:
+        ds = Path(target).resolve()
+    except Exception:
+        return {"ok": False, "error": "路径无效"}
+    csv = _clean_disposition_csv(ds)
+    if csv is None:
+        return {"ok": False, "error": "还没有清洗产物（先运行清洗质检 03）"}
+    items: list[dict] = []
+    n_total = 0
+    try:
+        lines = csv.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        header = lines[0].split(",") if lines else []
+        i_ex = header.index("reasons_exclude") if "reasons_exclude" in header else -1
+        i_vd = header.index("verdict") if "verdict" in header else 3
+        for ln in lines[1:]:
+            if not ln.strip():
+                continue
+            parts = ln.split(",")
+            n_total += 1
+            if i_vd >= len(parts) or "exclude" not in parts[i_vd].lower():
+                continue
+            reasons = (parts[i_ex] if 0 <= i_ex < len(parts) else "").split("|")
+            reasons = [r.strip() for r in reasons if r.strip()]
+            advice: list[str] = []
+            for r in reasons:
+                hit = next((a for kw, a in QC_ADVICE if kw in r), "")
+                advice.append(hit or QC_ADVICE_FALLBACK)
+            items.append({"ep": parts[0].strip(), "reasons": reasons, "advice": advice})
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"解析清洗产物失败：{e}"}
+    advice_all = "；".join(dict.fromkeys(a for it in items for a in it["advice"])) or \
+        "全部通过，无需处理"
+    return {"ok": True, "dataset": ds.name, "n_total": n_total,
+            "n_excluded": len(items), "items": items, "advice_all": advice_all}
+
+
+def scan_candidates(cfg: dict) -> list[dict]:
+    """扫描产出候选：数据集（v2.1/v3.0）与 原始源（带 config.json + source_type）。"""
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(d: Path) -> None:
+        key = str(d.resolve())
+        if key in seen:
+            return
+        seen.add(key)
+        info = _read_info(d)
+        sm = info.get("source_meta") or {}
+        source_type = sm.get("source_type") or ""
+        is_ds = bool(info.get("codebase_version")) or bool((d / "meta").is_dir())
+        if not is_ds and (d / "config.json").is_file():
+            try:
+                c = json.loads((d / "config.json").read_text(encoding="utf-8"))
+            except Exception:
+                c = {}
+            st = c.get("source_type") or source_type
+            if st:
+                out.append({"kind": "raw", "name": d.name, "path": str(d),
+                            "source_type": st, "task": c.get("task", ""),
+                            "n_demos": sum(1 for x in d.iterdir() if x.is_dir()),
+                            "updated_ts": _updated_ts(d),
+                            "steps": {}})
+            return
+        if not (d / "data").is_dir():
+            return
+        data_dir = d / "data"
+        is_v3 = bool(next(data_dir.glob("chunk-*/file-*.parquet"), None)) \
+            or (d / "meta" / "episodes").is_dir()
+        has_v21 = bool(next(data_dir.glob("chunk-*/episode_*.parquet"), None))
+        if not (is_v3 or has_v21):
+            return
+        kind = "v3.0" if is_v3 else "v2.1"
+        frames = 0
+        try:
+            for line in (d / "meta" / "episodes.jsonl").read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    frames += int(json.loads(line).get("length", 0))
+        except Exception:
+            pass
+        cam_feats = list((info.get("features") or {}).keys())
+        out.append({
+            "kind": "dataset", "name": d.name, "path": str(d),
+            "format": kind, "source_type": source_type or (sm.get("adapter", "").split(".")[0] or "teleop"),
+            "robot": info.get("robot_type", "?"), "fps": info.get("fps"),
+            "episodes": info.get("total_episodes"), "frames": frames,
+            "cams": cam_feats, "task": d.name.split("_")[0] if not source_type else d.name,
+            "updated_ts": _updated_ts(d),
+            "quality": _quality_summary(d),
+            "steps": {
+                "ingest": bool(source_type),
+                "clean": _stage_file(d, "clean", "episode_disposition.csv"),
+                "verify": _stage_file(d, "verify", "verify_report.json"),
+                "pack": _has_pack(d),
+            },
+        })
+
+    roots = batches_roots(cfg) + [Path(x) for x in load_extra_dirs()]
+    for root in roots:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        # 兼容：root 本身是一个数据集（--input 单目录）
+        if (root / "meta").is_dir():
+            add(root)
+            continue
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or child.name.endswith("_products") \
+               or child.name in ("verify_work", "dataprep_out", "_old"):
+                continue
+            # ingest_demo/datasets 这类"套一层"容器目录：往下扫一层
+            if (child / "meta").is_dir() or (child / "config.json").is_file():
+                add(child)
+            elif child.name in ("datasets",):
+                for c2 in sorted(child.iterdir()):
+                    if c2.is_dir():
+                        add(c2)
+    # demo 原始源（ingest_demo/*_raw_demo 等带 config.json 的非数据集目录）
+    demo = ROOT / "ingest_demo"
+    if demo.is_dir():
+        for child in sorted(demo.iterdir()):
+            if child.is_dir() and (child / "config.json").is_file() \
+               and not (child / "meta").is_dir():
+                add(child)
+    return out
+
+
+# ---------------------------------------------------------------- 引擎执行
+def run_tool(tool: str, target: str, cfg: dict, engine_py: str) -> dict:
+    tgt = Path(target)
+    parent = tgt.parent
+    prods = tgt.parent / f"{tgt.name}_products"
+    name = tgt.name
+
+    scripts = {
+        "ingest": [ROOT / "pipe" / "00_ingest.py",
+                   "--source", "", "--input", str(tgt), "--output", str(parent)],
+        "inspect": [ROOT / "pipe" / "01_inspect.py", "--input", str(tgt)],
+        "clean": [ROOT / "pipe" / "03_clean.py", "--input", str(tgt),
+                  "--out", str(prods / "clean")],
+        "verify": [ROOT / "pipe" / "07_verify.py", "--input", str(tgt)],
+        "pack": [ROOT / "pipe" / "08_pack.py", "--input", str(tgt),
+                 "--out", str(prods / "delivery")],
+        "record": [ROOT / "ledger" / "record.py", "--batch", str(tgt), "--stage", "final",
+                   "--yes", "--out", str(ledger_path(cfg))],
+        "dehand": [ROOT / "pipe" / "10_hand_remove.py", "--input", str(tgt)],
+    }
+    if tool not in scripts:
+        return {"ok": False, "log": f"未知工具 {tool}"}
+
+    cmd = scripts[tool]
+    if tool == "ingest":
+        # 从源目录 config.json 推断 source_type
+        st = ""
+        try:
+            c = json.loads((tgt / "config.json").read_text(encoding="utf-8"))
+            st = c.get("source_type", "")
+        except Exception:
+            pass
+        if st not in ("umi", "ego", "sim", "teleop"):
+            return {"ok": False, "log": f"无法推断源类型（config.json 缺 source_type）：{st}"}
+        cmd[cmd.index("--source") + 1] = st
+    elif tool == "record":
+        cmd += ["--operator", "launcher"]
+
+    log = f"$ {engine_py} {' '.join(str(x) for x in cmd)}\n"
+    try:
+        r = subprocess.run([engine_py] + [str(x) for x in cmd],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=900, cwd=str(ROOT))
+        tail = (r.stdout or "")[-LOG_MAX:] + "\n" + (r.stderr or "")[-2000:]
+        log += tail
+        return {"ok": r.returncode == 0, "exit": r.returncode, "log": log[-LOG_MAX * 2:]}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "log": log + "\n[超时] 900s 未完成，请人工检查。"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "log": log + f"\n[执行异常] {e}"}
+
+
+# ---------------------------------------------------------------- HTTP
+class Handler(SimpleHTTPRequestHandler):
+    engine_py: str = "python3"
+    cfg: dict = {}
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=str(DATADIR), **kw)
+
+    def log_message(self, *a):  # 静默
+        pass
+
+    def _json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):  # noqa: N802
+        if self.path.startswith("/api/"):
+            api = self.path[5:].split("?")[0]
+            if api == "hello":
+                return self._json({"ok": True, "app": "embodied-data-desk-launcher",
+                                   "engine_py": self.engine_py,
+                                   "workspace": str(WORKSPACE)})
+            if api == "batches":
+                cands = scan_candidates(self.cfg)
+                return self._json({"ok": True, "count": len(cands),
+                                   "items": cands,
+                                   "ledger": str(ledger_path(self.cfg))})
+            if api == "scandirs":
+                return self._json({"ok": True, "dirs": load_extra_dirs(),
+                                   "base": [str(p) for p in batches_roots(self.cfg)]})
+            if api == "qcmsg":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("target") or [""])[0]
+                if not tgt:
+                    return self._json({"ok": False, "error": "缺 target"}, 400)
+                return self._json(qc_human(tgt))
+            if api == "pickdir":
+                return self._json(pick_dir_native())
+            if api == "ledger":
+                return self._json(ledger_rows(self.cfg))
+            if api == "disposition":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("target") or [""])[0]
+                if not tgt:
+                    return self._json({"ok": False, "error": "缺 target"}, 400)
+                return self._json(disposition_rows(tgt))
+            if api == "review/episodes":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("path") or [""])[0]
+                if not tgt:
+                    return self._json({"ok": False, "error": "缺 path"}, 400)
+                return self._json(review_meta(tgt))
+            if api == "review/video":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("path") or [""])[0]
+                ep_raw = (qs.get("ep") or ["0"])[0]
+                ep = int(ep_raw) if ep_raw.isdigit() else -1
+                cam = (qs.get("cam") or [""])[0]
+                if not tgt or ep < 0:
+                    return self._json({"ok": False, "error": "缺 path/ep"}, 400)
+                try:
+                    f = find_episode_video(Path(tgt).resolve(), ep, cam)
+                except Exception:
+                    f = None
+                if f is None:
+                    return self._json({"ok": False, "error": f"未找到 ep{ep} {cam} 视频"}, 404)
+                return self._serve_mp4(f)
+            if api == "review/frames":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tgt = (qs.get("path") or [""])[0]
+                ep_raw = (qs.get("ep") or ["0"])[0]
+                ep = int(ep_raw) if ep_raw.isdigit() else -1
+                cam = (qs.get("cam") or [""])[0]
+                if not tgt or ep < 0:
+                    return self._json({"ok": False, "error": "缺 path/ep"}, 400)
+                return self._json(extract_frames(self.engine_py, tgt, ep, cam))
+            if api == "review/frameimg":
+                from urllib.parse import parse_qs, urlparse  # noqa: PLC0415
+                qs = parse_qs(urlparse(self.path).query)
+                tok = (qs.get("cache") or [""])[0]
+                ir = (qs.get("i") or ["0"])[0]
+                got = frame_image(tok, int(ir) if ir.isdigit() else 0) if tok else None
+                if got is None:
+                    return self._json({"ok": False, "error": "帧不存在（先调 /api/review/frames）"}, 404)
+                data, ctype = got
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "max-age=600")
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            return self._json({"ok": False, "error": f"未知 API {api}"}, 404)
+        if self.path in ("/", "/index.html"):
+            self.send_response(302)
+            self.send_header("Location", "/embodied-workspace/index.html")
+            self.end_headers()
+            return
+        return super().do_GET()
+
+    def _serve_mp4(self, f: Path):
+        """流式返回 mp4，支持 Range（206 分段）——浏览器 <video> 拖动进度条必需。"""
+        try:
+            size = f.stat().st_size
+            if size <= 0:
+                raise OSError
+            start, end = 0, size - 1
+            code = 200
+            rng = self.headers.get("Range")
+            if rng and rng.startswith("bytes="):
+                try:
+                    spec = rng[6:].split("-")
+                    s0 = int(spec[0]) if spec[0] else 0
+                    s1 = int(spec[1]) if len(spec) > 1 and spec[1] else size - 1
+                    if s0 >= size:
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.end_headers()
+                        return
+                    start, end = s0, min(s1, size - 1)
+                    code = 206
+                except ValueError:
+                    pass
+            self.send_response(code)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.end_headers()
+            with open(f, "rb") as fh:
+                fh.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = fh.read(min(65536, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except Exception as e:  # noqa: BLE001
+            try:
+                self.send_response(404)
+                self.end_headers()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _read_body(self) -> dict:
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
+        except Exception:
+            return {}
+
+    def _norm_dir(self, raw: str) -> Path | None:
+        """展开 ~ / 去引号；必须是已存在目录。"""
+        raw = (raw or "").strip().strip("\"'")
+        if not raw:
+            return None
+        p = Path(raw).expanduser().resolve()
+        return p if p.is_dir() else None
+
+    def do_POST(self):  # noqa: N802
+        if self.path.startswith("/api/run"):
+            body = self._read_body()
+            tool, target = body.get("tool", ""), body.get("target", "")
+            if not tool or not target:
+                return self._json({"ok": False, "error": "缺 tool/target"}, 400)
+            return self._json(run_tool(tool, target, self.cfg, self.engine_py))
+        if self.path.startswith("/api/scandirs"):
+            body = self._read_body()
+            raw = body.get("dir", "")
+            if body.get("remove"):
+                dirs = load_extra_dirs()
+                out = [d for d in dirs if not _same_dir(d, raw)]
+                save_extra_dirs(out)
+                return self._json({"ok": True, "dirs": out})
+            p = self._norm_dir(raw)
+            if p is None:
+                return self._json({"ok": False, "error": f"目录不存在：{raw}"}, 400)
+            dirs = load_extra_dirs()
+            key = str(p)
+            if key not in dirs:
+                dirs.append(key)
+                save_extra_dirs(dirs)
+            return self._json({"ok": True, "dirs": dirs})
+        return self._json({"ok": False, "error": "仅支持 /api/run、/api/scandirs"}, 404)
+
+
+def open_window(url: str) -> None:
+    edge_candidates = [
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for e in edge_candidates:
+        if Path(e).is_file():
+            subprocess.Popen([e, f"--app={url}", "--window-size=1440,920"],
+                             creationflags=0x08000000)  # CREATE_NO_WINDOW
+            return
+    webbrowser.open(url)
+
+
+class DeskServer(ThreadingHTTPServer):
+    """关闭 SO_REUSEADDR：Windows 上重复 bind 同一端口会"叠罗汉"式多实例监听，
+    浏览器请求随机落到旧实例 → 出现『新功能没有、报旧错误』的诡异问题。
+    置 False 后端口被占时 bind 直接失败，由 main 自动换到空闲端口。"""
+
+    allow_reuse_address = False
+
+
+def _is_launcher(url: str) -> bool:
+    """探测该地址是否已有本 launcher 在跑（app 名匹配），避免重复起服务。"""
+    import urllib.request  # noqa: PLC0415
+    try:
+        with urllib.request.urlopen(url + "api/hello", timeout=0.6) as r:
+            data = json.loads(r.read().decode("utf-8") or "{}")
+            return data.get("app") == "embodied-data-desk-launcher"
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def find_running(port: int) -> str | None:
+    """从 port 起小范围探测（默认端口与相邻几个），已有实例则返回其 URL。"""
+    for p in range(port, port + 6):
+        u = f"http://127.0.0.1:{p}/"
+        if _is_launcher(u):
+            return u
+    return None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--no-open", action="store_true", help="只起服务，不自动开窗口")
+    ap.add_argument("--engine-py", default=find_engine_py(), help="引擎 Python 解释器")
+    args = ap.parse_args()
+
+    Handler.engine_py = args.engine_py
+    Handler.cfg = load_config()
+    cfg_path = ROOT / "config.yaml"
+
+    if not WORKSPACE.is_dir():
+        print(f"[!] 未找到工作台目录: {WORKSPACE}（launcher 应放在数据系统目录下两个仓库并列）")
+        return 2
+
+    # 幂等：已有实例在跑 → 直接开它的窗口并退出，绝不重复起服务
+    running = find_running(args.port)
+    if running:
+        print(f"[launcher] 已有实例运行于 {running}，直接打开窗口（如需重启请先关闭旧窗口/进程）")
+        if not args.no_open:
+            open_window(running)
+        return 0
+
+    # 端口被占 → 先短等重试原端口（杀进程后 TIME_WAIT 需几秒释放，避免端口漂移），
+    # 仍失败再自动递增找空闲端口
+    httpd = None
+    port = args.port
+    for attempt in range(6):
+        try:
+            httpd = DeskServer(("127.0.0.1", port), Handler)
+            break
+        except OSError:
+            if attempt == 0:
+                import time  # noqa: PLC0415
+                time.sleep(4)
+                continue
+            port += 1
+    if httpd is None:
+        print(f"[!] 端口 {args.port}-{args.port + 5} 均被占用，请先关闭残留进程")
+        return 3
+    if port != args.port:
+        print(f"[i] 端口 {args.port} 被占用，已改用 {port}")
+
+    url = f"http://127.0.0.1:{port}/"
+    print(f"[launcher] 数据处理台服务已启动: {url}")
+    print(f"[launcher] 引擎 Python: {Handler.engine_py}")
+    print(f"[launcher] 工作台: {WORKSPACE}")
+    if cfg_path.is_file():
+        print(f"[launcher] 配置: {cfg_path}（paths.batches 决定扫描范围）")
+    else:
+        print("[launcher] 提示: 无 config.yaml，扫描默认 ingest_demo/datasets")
+    if not args.no_open:
+        open_window(url)
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n[launcher] 已停止")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

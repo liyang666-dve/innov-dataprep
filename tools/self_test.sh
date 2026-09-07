@@ -21,8 +21,8 @@ ok "make_demo_data"
 echo "== 2/11 03 清洗：脏集应全排除(5)，干净集应全保留(5) =="
 "$PYTHON_BIN" pipe/03_clean.py --input "$TMP/dirty" --out "$TMP/out_dirty" >/dev/null || { bad "03 脏集运行失败"; exit 1; }
 "$PYTHON_BIN" pipe/03_clean.py --input "$TMP/clean" --out "$TMP/out_clean" >/dev/null || { bad "03 干净集运行失败"; exit 1; }
-D_EXC=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open('$TMP/out_dirty/summary.json'))['n_exclude'])")
-C_EXC=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open('$TMP/out_clean/summary.json'))['n_exclude'])")
+D_EXC=$(F="$TMP/out_dirty/summary.json" K=n_exclude "$PYTHON_BIN" -c "import json,os; print(json.load(open(os.environ['F']))[os.environ['K']])")
+C_EXC=$(F="$TMP/out_clean/summary.json" K=n_exclude "$PYTHON_BIN" -c "import json,os; print(json.load(open(os.environ['F']))[os.environ['K']])")
 [ "$D_EXC" = "5" ] && ok "脏集排除数=5（实际 $D_EXC）" || bad "脏集排除数应为 5，实际 $D_EXC"
 [ "$C_EXC" = "0" ] && ok "干净集排除数=0（实际 $C_EXC）" || bad "干净集排除数应为 0，实际 $C_EXC"
 
@@ -55,18 +55,18 @@ MERGE_DISP="$TMP/out_dirty/episode_disposition.csv"
     --output "$TMP/merged_excl" --overwrite \
     --dispositions "" "$MERGE_DISP" >/dev/null 2>&1
 RC_M=$?
-ME=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open('$TMP/merged_excl/meta/info.json'))['total_episodes'])" 2>/dev/null || echo "?")
+ME=$(F="$TMP/merged_excl/meta/info.json" K=total_episodes "$PYTHON_BIN" -c "import json,os; print(json.load(open(os.environ['F']))[os.environ['K']])" 2>/dev/null || echo "?")
 [ $RC_M -eq 0 ] && [ "$ME" = "5" ] && ok "合并排除后=5集（实际 $ME）" || bad "合并排除后应为 5 集，实际 $ME rc=$RC_M"
 "$PYTHON_BIN" pipe/05_merge.py --inputs "$TMP/clean" "$TMP/dirty" \
     --output "$TMP/merged_all" --overwrite --no-exclude >/dev/null 2>&1
-MA=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open('$TMP/merged_all/meta/info.json'))['total_episodes'])" 2>/dev/null || echo "?")
+MA=$(F="$TMP/merged_all/meta/info.json" K=total_episodes "$PYTHON_BIN" -c "import json,os; print(json.load(open(os.environ['F']))[os.environ['K']])" 2>/dev/null || echo "?")
 [ "$MA" = "10" ] && ok "不排除合并=10集（实际 $MA）" || bad "不排除合并应为 10 集，实际 $MA"
 
 echo "== 8/11 合并防呆 + 产物回检 =="
 "$PYTHON_BIN" pipe/05_merge.py --inputs "$TMP/clean" --output "$TMP/x" --overwrite >/dev/null 2>&1
 [ $? -ne 0 ] && ok "单输入被拒绝" || bad "单输入应被拒绝"
 "$PYTHON_BIN" pipe/03_clean.py --input "$TMP/merged_excl" --out "$TMP/out_merged" >/dev/null 2>&1
-MC=$("$PYTHON_BIN" -c "import json,sys; print(json.load(open('$TMP/out_merged/summary.json'))['n_exclude'])" 2>/dev/null || echo "?")
+MC=$(F="$TMP/out_merged/summary.json" K=n_exclude "$PYTHON_BIN" -c "import json,os; print(json.load(open(os.environ['F']))[os.environ['K']])" 2>/dev/null || echo "?")
 [ "$MC" = "0" ] && ok "合并产物再过 03 全保留（排除 $MC）" || bad "合并产物再过 03 应为 0 排除，实际 $MC"
 "$PYTHON_BIN" pipe/05_merge.py --inputs "$TMP/clean" "$TMP/dirty" \
     --output "$TMP/merged_excl" --dispositions "" "$MERGE_DISP" >/dev/null 2>&1
