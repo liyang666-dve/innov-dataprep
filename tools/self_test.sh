@@ -9,6 +9,10 @@ PYTHON_BIN="$(command -v "$PY" || echo "$PY")"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# 自测必须"密封"：显式指定一个不存在的 config，避免本机 config.yaml（阈值定标过）
+# 改变判定结果 —— 否则又变成"别的电脑行、这台不行"。
+CFG_NONE="$TMP/no_such_config.yaml"
+
 pass=0; fail=0
 ok()   { echo "  [PASS] $1"; pass=$((pass+1)); }
 bad()  { echo "  [FAIL] $1"; fail=$((fail+1)); }
@@ -19,8 +23,8 @@ echo "== 1/12 造脏数据集 + 干净数据集 =="
 ok "make_demo_data"
 
 echo "== 2/12 03 清洗：脏集应全排除(5)，干净集应全保留(5) =="
-"$PYTHON_BIN" pipe/03_clean.py --input "$TMP/dirty" --out "$TMP/out_dirty" >/dev/null || { bad "03 脏集运行失败"; exit 1; }
-"$PYTHON_BIN" pipe/03_clean.py --input "$TMP/clean" --out "$TMP/out_clean" >/dev/null || { bad "03 干净集运行失败"; exit 1; }
+"$PYTHON_BIN" pipe/03_clean.py --input "$TMP/dirty" --out "$TMP/out_dirty" --config "$CFG_NONE" >/dev/null || { bad "03 脏集运行失败"; exit 1; }
+"$PYTHON_BIN" pipe/03_clean.py --input "$TMP/clean" --out "$TMP/out_clean" --config "$CFG_NONE" >/dev/null || { bad "03 干净集运行失败"; exit 1; }
 D_EXC=$(F="$TMP/out_dirty/summary.json" K=n_exclude "$PYTHON_BIN" -c "import json,os; print(json.load(open(os.environ['F']))[os.environ['K']])")
 C_EXC=$(F="$TMP/out_clean/summary.json" K=n_exclude "$PYTHON_BIN" -c "import json,os; print(json.load(open(os.environ['F']))[os.environ['K']])")
 [ "$D_EXC" = "5" ] && ok "脏集排除数=5（实际 $D_EXC）" || bad "脏集排除数应为 5，实际 $D_EXC"
@@ -109,7 +113,7 @@ PYEOF
 
 echo "== 11/12 QA 汇总(12)：三档结论 + 门禁 =="
 cp -r "$TMP/clean" "$TMP/qa_ds"
-"$PYTHON_BIN" pipe/03_clean.py --input "$TMP/qa_ds" >/dev/null 2>&1   # 走新布局: 写 _products/clean
+"$PYTHON_BIN" pipe/03_clean.py --input "$TMP/qa_ds" --config "$CFG_NONE" >/dev/null 2>&1   # 走新布局: 写 _products/clean
 "$PYTHON_BIN" pipe/12_qa_report.py --input "$TMP/qa_ds" >/dev/null 2>&1
 [ $? -eq 0 ] && ok "12 QA 汇总成功(rc=0)" || bad "12 QA 汇总应成功"
 QA_JSON="$TMP/qa_ds_products/qa/qa_summary.json"
