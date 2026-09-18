@@ -57,6 +57,7 @@ function pick(path) {
 }
 function verdictChip(v) {
   if (v === "keep") return '<span class="chip" style="background:#e6f6ec;color:#186a3b">✓ 保留</span>';
+  if (v === "review") return '<span class="chip" style="background:#fff6e5;color:#8a5a00">🔍 待复核</span>';
   if (v === "exclude") return '<span class="chip" style="background:#fdecea;color:#942a25">✗ 排除</span>';
   return '<span class="chip" style="background:#eef1f4;color:#7b8694">未质检</span>';
 }
@@ -106,7 +107,12 @@ function renderCams() {
   setVerdict(`ep${CUR.episode} · ${verdictText(CUR.verdict)} · 建议：${CUR.handling || "-"}${why}`);
   loadVideo();
 }
-function verdictText(v) { return v === "keep" ? "质检✓保留" : v === "exclude" ? "质检✗排除" : "未质检"; }
+function verdictText(v) {
+  if (v === "keep") return "质检✓保留";
+  if (v === "review") return "质检🔍待复核";
+  if (v === "exclude") return "质检✗排除";
+  return "未质检";
+}
 function setVerdict(t) { document.getElementById("verdict").textContent = t; }
 
 async function loadVideo() {

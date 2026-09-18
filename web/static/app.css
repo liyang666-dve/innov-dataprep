@@ -42,6 +42,7 @@ td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .bad { color: #c0392b; }
 .verdict { font-weight: 700; }
 .v-keep { color: #25782b; }
+.v-review { color: #b8860b; }
 .v-exclude { color: #c0392b; }
 .hint { background: #fff6e6; color: #8a5b00; border: 1px solid #f3d9a4; border-radius: 6px;
         padding: 8px 12px; margin: 8px 0; font-size: 13px; white-space: pre-wrap; }

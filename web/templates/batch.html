@@ -53,15 +53,16 @@ async function load() {
     const c = el("div","card");
     c.appendChild(el("h2", null, "质检明细（episode_disposition.csv）"));
     const t = el("table");
-    t.innerHTML = `<thead><tr><th>episode</th><th>verdict</th><th>时长(s)</th><th>排除原因</th><th>警告</th><th>行数</th></tr></thead>`;
+    t.innerHTML = `<thead><tr><th>episode</th><th>verdict</th><th>时长(s)</th><th>排除原因</th><th>待复核原因</th><th>警告</th><th>行数</th></tr></thead>`;
     const tb = el("tbody");
     for (const r of art.disposition) {
       const tr = el("tr");
       const v = r.verdict;
       tr.innerHTML = `<td class="num">${r.episode}</td>
-        <td class="verdict ${v==='exclude'?'v-exclude':'v-keep'}">${v}</td>
+        <td class="verdict ${v==='exclude'?'v-exclude':(v==='review'?'v-review':'v-keep')}">${v}</td>
         <td class="num">${r.duration_s}</td>
         <td>${r.reasons_exclude !== '-' ? r.reasons_exclude : '-'}</td>
+        <td>${r.reasons_review && r.reasons_review !== '-' ? r.reasons_review : '-'}</td>
         <td>${r.reasons_warn !== '-' ? r.reasons_warn : '-'}</td>
         <td class="num">${r.n_rows}</td>`;
       tb.appendChild(tr);

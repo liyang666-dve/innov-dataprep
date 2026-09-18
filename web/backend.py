@@ -230,18 +230,23 @@ def get_qc() -> dict:
         disp = art["disposition"] or []
         if not disp:
             continue  # 未执行清洗质检(03)的批次不在此页展示
-        per_ep, n_ex, n_warn = [], 0, 0
+        per_ep, n_ex, n_warn, n_rev = [], 0, 0, 0
         for row in disp:
             verdict = (row.get("verdict") or "keep").strip()
             rex = _split_reasons(row.get("reasons_exclude"))
+            rrv = _split_reasons(row.get("reasons_review"))
             rwn = _split_reasons(row.get("reasons_warn"))
             handling = ""
             if verdict == "exclude":
                 handling = suggest(rex[0]) if rex else "建议排除"
+            elif verdict == "review":
+                handling = "待复核：" + (rrv[0] if rrv else "统计信号异常")
             elif rwn:
                 handling = "可保留（有警告）"
             if verdict == "exclude":
                 n_ex += 1
+            if verdict == "review":
+                n_rev += 1
             if rwn:
                 n_warn += 1
             per_ep.append({
@@ -250,6 +255,7 @@ def get_qc() -> dict:
                 "duration_s": row.get("duration_s"),
                 "verdict": verdict,
                 "reasons_exclude": rex,
+                "reasons_review": rrv,
                 "reasons_warn": rwn,
                 "handling": handling,
             })
@@ -264,6 +270,7 @@ def get_qc() -> dict:
             "clean_dir": art["clean_dir"],
             "n_keep": n_keep,
             "n_exclude": n_ex,
+            "n_review": n_rev,
             "n_warn": n_warn,
             "excluded_episodes": sj.get("excluded_episodes") or [
                 p["episode"] for p in per_ep if p["verdict"] == "exclude"],

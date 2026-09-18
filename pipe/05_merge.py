@@ -236,11 +236,13 @@ def merge_datasets(sources: list[Path], output: Path, dispositions: list[dict[in
         disp = dispositions[src_idx]
         src_chunks = int(info.get("chunks_size", chunks_size))
 
-        n_in, n_out = 0, 0
+        n_in, n_out, n_review = 0, 0, 0
         for old_ep in sorted(episodes):
             if disp and disp.get(old_ep) == "exclude":
                 n_out += 1
                 continue
+            if disp and disp.get(old_ep) == "review":
+                n_review += 1
             ep_row = dict(episodes[old_ep])
             new_ep = total_episodes
             new_chunk = new_ep // chunks_size
@@ -288,7 +290,8 @@ def merge_datasets(sources: list[Path], output: Path, dispositions: list[dict[in
             total_episodes += 1
             n_in += 1
         per_source.append((src.name, n_in, n_out))
-        print(f"  [{src.name}] 并入 {n_in} 集 / 排除 {n_out} 集")
+        extra = f" / 含 review {n_review} 集（未排除，建议复核）" if n_review else ""
+        print(f"  [{src.name}] 并入 {n_in} 集 / 排除 {n_out} 集{extra}")
 
     if total_episodes == 0:
         raise ValueError("所有源的所有 episode 均被排除，拒绝产出空数据集（请检查处置清单或 --no-exclude）")

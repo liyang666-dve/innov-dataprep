@@ -22,6 +22,7 @@ v2.1 与 v3.0 行为一致。关节类判定因数组列没有关节名（无法
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -50,6 +51,17 @@ DEFAULT_QC = {
     "blur_laplacian_thr": 3.0,    # 帧 Laplacian 方差阈值（绝对）
     "blur_bad_ratio": 0.10,       # 低于阈值的帧占比 -> exclude
     "blur_sample_frames": 200,    # 每相机抽帧上限（控成本）
+
+    # --- 动作/状态统计信号（review 级：只提示、绝不排除）---
+    # 这几项对标 lerobot-doctor / RDA 的核心检查（零方差维、动作尖峰、僵死维、有效运动比）
+    "zero_var_eps": 1e-6,           # 维度标准差小于它 -> 常量维（review）
+    "action_spike_sigma": 8.0,      # 逐维 |Δ| 超过 8×该维整体标准差 -> 尖峰（review，对齐 lerobot-doctor）
+    "action_spike_min_abs": 0.5,    # 且绝对跳变 >= 该值（rad）才算尖峰，避免平滑数据的抖动误报
+    "stuck_dim_ratio": 0.8,         # 单维不变帧占比超过 -> 记为「僵死维」（info 级，报告里汇总）
+    "idle_move_eps": 1e-3,          # 单帧全维位移小于它算静止
+    "idle_ratio_warn": 0.90,        # 静止帧占比超过 -> review（有效运动比 <10%）
+    "duration_outlier_sigma": 3.0,  # 时长偏离均值超过 3σ -> review
+    "stats_drift_tol": 0.05,        # meta/episodes_stats 与实测均值偏差超过该比例 -> review
 }
 
 
@@ -71,6 +83,138 @@ def _gripper_like(col: str) -> bool:
     return any(h in col.lower() for h in GRIPPER_HINTS)
 
 
+# ---------------------------------------------------------------- 统计信号（review 级）
+def _signal_checks(df: "pd.DataFrame", qc: dict) -> tuple[list[str], dict]:
+    """零方差维 / 动作尖峰 / 僵死维 / 有效运动比。
+
+    纯统计、与本体无关，v2.1 与 v3.0、数组列（已展开）与点分列通用。
+    判据（对齐 lerobot-doctor 的口径，2026-09 在真实 0730 三批上定标）：
+      · 常量维：该维标准差 < zero_var_eps            -> review（通道死了/没记）
+      · 尖峰  ：|Δ| > max(σ倍数×该维标准差, 绝对下限)  -> review（真实跳变）
+      · 静止帧占比 > idle_ratio_warn                 -> review（几乎没动）
+      · 僵死维（不变帧占比高）                        -> **info 级**，数据集汇总里列出
+        （夹爪本来就常驻不动，逐集标 review 会把 100% 集都标上，等于没标）
+
+    只产生 review 级原因，从不参与 exclude —— 阈值未定标前不能杀数据。
+    """
+    review: list[str] = []
+    info: dict[str, Any] = {}
+    k_sig = float(qc.get("action_spike_sigma") or 0)
+    floor = float(qc.get("action_spike_min_abs") or 0)
+    zero_eps = float(qc.get("zero_var_eps") or 0)
+    stuck_thr = float(qc.get("stuck_dim_ratio") or 1.1)
+    idle_warn = float(qc.get("idle_ratio_warn") or 1.1)
+    idle_eps = float(qc.get("idle_move_eps") or 0)
+
+    for prefix, tag in (("action", "action"), ("observation.state", "state")):
+        cols = [c for c in df.columns if c.startswith(prefix + ".")]
+        if not cols:
+            continue
+        X = df[cols].to_numpy(dtype=np.float64)
+        if X.size:
+            X = X[np.isfinite(X).all(axis=1)]
+        if X.shape[0] < 2:
+            continue
+        with np.errstate(all="ignore"):
+            info[f"{tag}_n_dims"] = int(X.shape[1])
+            std = np.nanstd(X, axis=0)
+            const = [i for i, v in enumerate(std) if v < zero_eps]
+            info[f"{tag}_const_dims"] = const
+            if const:
+                review.append(f"{prefix} 常量维 {len(const)} 个 dim{const[:8]}"
+                              f"{'…' if len(const) > 8 else ''}（标准差<{zero_eps:g}）")
+            D = np.diff(X, axis=0)
+            if not D.size:
+                continue
+            thr = np.maximum(k_sig * std, floor) if k_sig > 0 else np.full_like(std, np.inf)
+            over = np.abs(D) > thr
+            n_sp = int(over.sum())
+            info[f"{tag}_spikes"] = n_sp
+            if n_sp:
+                idx = np.unravel_index(int(np.argmax(np.abs(D) - thr)), D.shape)
+                if np.abs(D[idx]) > thr[idx[1]]:
+                    review.append(f"{prefix} 尖峰 {n_sp} 处 (>max({k_sig:g}σ,{floor:g}rad))，"
+                                  f"最坏 {abs(float(D[idx])):.3f} rad @dim{idx[1]}")
+            ratio = (np.abs(D) < 1e-12).mean(axis=0)
+            stuck = [i for i, r in enumerate(ratio) if r > stuck_thr]
+            info[f"{tag}_stuck_dims"] = stuck
+            step = np.linalg.norm(D, axis=1)
+            idle = float((step < idle_eps).mean()) if step.size else 0.0
+            info[f"{tag}_idle_ratio"] = round(idle, 4)
+            info[f"{tag}_max_jump"] = round(float(np.nanmax(np.abs(D))), 4)
+            if idle > idle_warn:
+                review.append(f"{prefix} 静止帧占比 {idle:.0%} > {idle_warn:.0%}"
+                              f"（有效运动比 {1 - idle:.0%}）")
+    return review, info
+
+
+def _fingerprint(df: "pd.DataFrame") -> str | None:
+    """近重复集指纹：state/action 逐维均值+标准差的 2 位小数摘要。"""
+    vec: list[float] = []
+    for prefix in ("observation.state", "action"):
+        cols = [c for c in df.columns if c.startswith(prefix + ".")]
+        if not cols:
+            continue
+        X = df[cols].to_numpy(dtype=np.float64)
+        if not X.size:
+            continue
+        with np.errstate(all="ignore"):
+            vec += [round(float(v), 2) for v in np.nanmean(X, axis=0)]
+            vec += [round(float(v), 2) for v in np.nanstd(X, axis=0)]
+    if not vec:
+        return None
+    return hashlib.sha1(json.dumps(vec).encode()).hexdigest()[:12]
+
+
+def _parse_meta_stats(ds: Path) -> dict[int, dict]:
+    """读 meta/episodes_stats.jsonl（用于 stats 漂移检查）；缺失返回 {}。"""
+    p = ds / "meta" / "episodes_stats.jsonl"
+    if not p.is_file():
+        return {}
+    out: dict[int, dict] = {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                r = json.loads(line)
+                out[int(r["episode_index"])] = r.get("stats") or {}
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
+def _stats_drift(df: "pd.DataFrame", stats: dict, tol: float) -> str | None:
+    """meta 里的 stats 均值与实测均值偏差（超过 tol×该维标准差 -> 提示）。"""
+    if not stats or not tol:
+        return None
+    worst = 0.0
+    worst_key = ""
+    for prefix in ("observation.state", "action"):
+        cols = [c for c in df.columns if c.startswith(prefix + ".")]
+        st = stats.get(prefix)
+        if not cols or not isinstance(st, dict):
+            continue
+        X = df[cols].to_numpy(dtype=np.float64)
+        if not X.size:
+            continue
+        with np.errstate(all="ignore"):
+            cur = np.nanmean(X, axis=0)
+            ref = np.asarray(st.get("mean") or [], dtype=np.float64)
+            scale = np.asarray(st.get("std") or [], dtype=np.float64)
+        if ref.shape != cur.shape:
+            continue
+        scale = np.where(np.abs(scale) < 1e-9, 1.0, np.abs(scale))
+        rel = np.abs(cur - ref) / scale
+        if rel.size and float(np.nanmax(rel)) > worst:
+            worst = float(np.nanmax(rel))
+            worst_key = f"{prefix} dim{int(np.nanargmax(rel))}"
+    if worst > tol:
+        return f"stats 与实测不符（{worst_key} 偏差 {worst:.0%} > {tol:.0%}，meta/episodes_stats.jsonl 可能是旧值）"
+    return None
+
+
 def _state_arrays(df: pd.DataFrame) -> tuple[list[str], np.ndarray]:
     """返回 (非夹爪关节列, 矩阵)；缺列时为空。"""
     cols = [c for c in df.columns if c.startswith("observation.state.") and not _gripper_like(c)]
@@ -90,6 +234,7 @@ def check_episode(df: pd.DataFrame, meta_info: dict, qc: dict, nominal_fps: floa
     n = len(df)
     exclude: list[str] = []
     warn: list[str] = []
+    review: list[str] = []
 
     # --- 状态/动作维度一致性
     state_feats = {c[len("observation.state."):] for c in df.columns if c.startswith("observation.state.")}
@@ -181,11 +326,22 @@ def check_episode(df: pd.DataFrame, meta_info: dict, qc: dict, nominal_fps: floa
             elif abs(diff) > 1:
                 exclude.append(f"视频帧数不符 {cam}: {v['frames']} vs {n} (差 {diff:+d})")
 
+    # --- 统计信号（零方差维/尖峰/僵死维/有效运动比）：只提示，不排除
+    sig_review, signals = _signal_checks(df, qc)
+    review += sig_review
+
+    dims = {p: len([c for c in df.columns if c.startswith(p + ".")])
+            for p in ("action", "observation.state")}
+    verdict = "exclude" if exclude else ("review" if review else "keep")
     return {
         "n_rows": n, "duration_s": round(dur, 3),
-        "verdict": "exclude" if exclude else "keep",
+        "verdict": verdict,
         "reasons_exclude": exclude,
+        "reasons_review": review,
         "reasons_warn": warn,
+        "signals": signals,
+        "dims": dims,
+        "fingerprint": _fingerprint(df),
     }
 
 
@@ -317,6 +473,9 @@ def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
 
     ep_rows = []
     ep_joint_obs: list[tuple[int, dict]] = []
+    meta_stats = _parse_meta_stats(ds)
+    if not meta_stats:
+        print(f"[i] {ds.name}: 无 meta/episodes_stats.jsonl，跳过 stats 漂移检查")
     for p in eps_paths:
         ep_idx = dataset_io.episode_index(p)
         df = dataset_io.expand_array_features(pd.read_parquet(p))
@@ -339,6 +498,10 @@ def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
                 fr = video_utils.count_frames(cand)
                 vsum[cam] = {"frames": fr, "missing": False, "path": cand}
         q = check_episode(df, info, qc, nominal, vsum, check_joints=joints_on)
+        if meta_stats.get(ep_idx):
+            drift = _stats_drift(df, meta_stats[ep_idx], float(qc.get("stats_drift_tol") or 0))
+            if drift:
+                q["reasons_review"].append(drift)
         if has_arrays and not joints_on:
             obs = _joint_observation(df, nominal)
             if obs:
@@ -352,29 +515,122 @@ def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
         ep_rows.append({"episode": ep_idx, "n_rows": n_rows, "_qc": q, "videos": vsum})
 
     ep_rows.sort(key=lambda x: x["episode"])
-    n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
-    n_excl = len(ep_rows) - n_keep
-
+    ds_info = _dataset_level(ep_rows, ds, qc)
+    _print_counts(ep_rows)
     out_root = Path(args.out) if args.out else dataset_io.new_stage_dir(ds, "clean")
-    return _finalize_qc(ds, out_root, ep_rows, nominal, n_keep, n_excl,
-                        joint_obs=_merge_joint_obs(ep_joint_obs, qc))
+    return _finalize_qc(ds, out_root, ep_rows, nominal,
+                        joint_obs=_merge_joint_obs(ep_joint_obs, qc), ds_info=ds_info)
+
+
+def _print_counts(ep_rows: list[dict]) -> None:
+    n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
+    n_rev = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "review")
+    n_ex = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "exclude")
+    print(f"      三档: keep {n_keep} / review {n_rev} / exclude {n_ex}")
+
+
+# ---------------------------------------------------------------- 数据集级后处理
+def _dataset_level(ep_rows: list[dict], ds: Path, qc: dict) -> dict:
+    """跨集统计：维度一致性(exclude) / 时长离群(review) / stats 漂移(review) / 近重复(info)。
+
+    在单集检查之后统一执行，并按最终原因重算 verdict（exclude > review > keep）。
+    """
+    info: dict[str, Any] = {}
+    if not ep_rows:
+        return info
+
+    # 维度一致性：与首个集不一致 -> exclude（下游按固定维度建模型）
+    dims0 = ep_rows[0]["_qc"].get("dims")
+    if dims0 and any(dims0.values()):
+        bad = [e["episode"] for e in ep_rows if e["_qc"].get("dims") != dims0]
+        for e in ep_rows:
+            if e["_qc"].get("dims") != dims0:
+                e["_qc"]["reasons_exclude"].append(
+                    f"特征维度与首个集不一致 {e['_qc'].get('dims')} != {dims0}")
+        if bad:
+            info["dim_mismatch_episodes"] = bad
+
+    # 时长离群
+    sigma = float(qc.get("duration_outlier_sigma") or 0)
+    durs = np.array([e["_qc"]["duration_s"] for e in ep_rows], dtype=np.float64)
+    if sigma and durs.size >= 5 and float(durs.std()) > 0:
+        mu, sd = float(durs.mean()), float(durs.std())
+        flagged = []
+        for e in ep_rows:
+            if abs(e["_qc"]["duration_s"] - mu) > sigma * sd:
+                e["_qc"]["reasons_review"].append(
+                    f"时长离群 {e['_qc']['duration_s']:.1f}s（均值 {mu:.1f}±{sd:.1f}s，>{sigma:g}σ）")
+                flagged.append(e["episode"])
+        if flagged:
+            info["duration_outlier_episodes"] = flagged
+
+    # 近重复集（指纹相同 -> info，只提示）
+    fps: dict[str, list[int]] = {}
+    for e in ep_rows:
+        fp = e["_qc"].get("fingerprint")
+        if fp:
+            fps.setdefault(fp, []).append(e["episode"])
+    dups = [v for v in fps.values() if len(v) > 1]
+    if dups:
+        info["near_duplicate_groups"] = dups
+
+    # 统计信号汇总（info 级）：常量维 / 僵死维 / 静止帧占比 / 尖峰总数
+    sig_rows = [e for e in ep_rows if e["_qc"].get("signals")]
+    if sig_rows:
+        n = len(sig_rows)
+        agg: dict[str, Any] = {"n_episodes": n}
+        for prefix in ("action", "state"):
+            key = f"{prefix}_idle_ratio"
+            vals = [e["_qc"]["signals"].get(key) for e in sig_rows]
+            vals = [float(v) for v in vals if v is not None]
+            if vals:
+                agg[key] = {"p50": round(float(np.median(vals)), 3),
+                            "p90": round(float(np.percentile(vals, 90)), 3),
+                            "max": round(max(vals), 3)}
+            for name, field in (("stuck", f"{prefix}_stuck_dims"),
+                                ("const", f"{prefix}_const_dims")):
+                cnt: dict[int, int] = {}
+                for e in sig_rows:
+                    for d in e["_qc"]["signals"].get(field) or []:
+                        cnt[int(d)] = cnt.get(int(d), 0) + 1
+                if cnt:
+                    agg[f"{prefix}_{name}_dims"] = {
+                        f"dim{d}": f"{c}/{n} 集"
+                        for d, c in sorted(cnt.items(), key=lambda kv: -kv[1])[:12]}
+            jumps = [(e["episode"], e["_qc"]["signals"].get(f"{prefix}_max_jump")) for e in sig_rows]
+            jumps = [(ep, float(v)) for ep, v in jumps if v is not None]
+            jumps.sort(key=lambda t: -t[1])
+            if jumps:
+                agg[f"{prefix}_max_jump_top"] = {f"ep{ep}": v for ep, v in jumps[:3]}
+            agg[f"{prefix}_spikes_total"] = int(sum(
+                int(e["_qc"]["signals"].get(f"{prefix}_spikes") or 0) for e in sig_rows))
+        info["signals_summary"] = agg
+
+    for e in ep_rows:
+        q = e["_qc"]
+        q["verdict"] = ("exclude" if q["reasons_exclude"]
+                        else ("review" if q["reasons_review"] else "keep"))
+    return info
 
 
 def _finalize_qc(ds: Path, out_root: Path, ep_rows: list[dict], nominal: float,
-                 n_keep: int | None = None, n_excl: int | None = None,
-                 joint_obs: dict | None = None) -> dict:
-    """写 episode_disposition.csv / summary.json / qc_report.md（v2.1/v3.0 共用）。"""
-    if n_keep is None:
-        n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
-    if n_excl is None:
-        n_excl = len(ep_rows) - n_keep
+                 joint_obs: dict | None = None, ds_info: dict | None = None) -> dict:
+    """写 episode_disposition.csv / summary.json / qc_report.md（v2.1/v3.0 共用）。
+
+    verdict 三档：exclude（硬伤，05 合并排除）/ review（需人看，05 不排除）/
+    keep。review 与 info 只提示，绝不删数据。
+    """
     out_root.mkdir(parents=True, exist_ok=True)
+    n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
+    n_review = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "review")
+    n_excl = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "exclude")
 
     rows = []
     for e in ep_rows:
         r = {"episode": e["episode"], "n_rows": e["n_rows"], "verdict": e["_qc"]["verdict"],
              "duration_s": e["_qc"]["duration_s"],
              "reasons_exclude": " | ".join(e["_qc"]["reasons_exclude"]) or "-",
+             "reasons_review": " | ".join(e["_qc"].get("reasons_review") or []) or "-",
              "reasons_warn": " | ".join(e["_qc"]["reasons_warn"]) or "-"}
         for cam, v in e["videos"].items():
             r[f"video_{cam}"] = ("缺失" if v["missing"] else
@@ -382,27 +638,55 @@ def _finalize_qc(ds: Path, out_root: Path, ep_rows: list[dict], nominal: float,
         rows.append(r)
     report.write_csv(out_root / "episode_disposition.csv", rows)
 
+    review_eps = [e["episode"] for e in ep_rows if e["_qc"]["verdict"] == "review"]
     summary = {
         "dataset": ds.name, "path": str(ds), "nominal_fps": nominal,
-        "n_episodes": len(ep_rows), "n_keep": n_keep, "n_exclude": n_excl,
+        "n_episodes": len(ep_rows), "n_keep": n_keep, "n_review": n_review, "n_exclude": n_excl,
         "excluded_episodes": [e["episode"] for e in ep_rows if e["_qc"]["verdict"] == "exclude"],
+        "review_episodes": review_eps,
         "disposition_csv": str(out_root / "episode_disposition.csv"),
     }
     if joint_obs:
         summary["joint_observation"] = joint_obs
+    if ds_info:
+        summary["dataset_level"] = ds_info
     report.write_json(out_root / "summary.json", summary)
 
     md = [
         f"# 质检报告: {ds.name}", "",
-        f"- 通过 keep: {n_keep} / {n_excl} 排除",
-        f"- 排除集: {summary['excluded_episodes'] or '无'}",
+        f"- keep {n_keep} / **review {n_review}** / exclude {n_excl}（共 {len(ep_rows)} 集）",
+        f"- 排除集（05 合并会剔除）: {summary['excluded_episodes'] or '无'}",
+        f"- 待复核集（05 不剔除，建议人看/进盲审页）: {review_eps[:30] or '无'}"
+        f"{' …' if len(review_eps) > 30 else ''}",
         "", "## 逐集", "",
         "| ep | 行数 | 时长s | 结论 | 原因 |", "|---|---|---|---|---|",
     ]
     for e in ep_rows:
         q = e["_qc"]
-        why = "; ".join(q["reasons_exclude"] + [f"⚠ {w}" for w in q["reasons_warn"]]) or "✓"
+        why = "; ".join(q["reasons_exclude"]
+                        + [f"🔍 {r}" for r in (q.get("reasons_review") or [])]
+                        + [f"⚠ {w}" for w in q["reasons_warn"]]) or "✓"
         md.append(f"| {e['episode']} | {e['n_rows']} | {q['duration_s']:.2f} | {q['verdict']} | {why} |")
+    if ds_info:
+        bits = []
+        if ds_info.get("dim_mismatch_episodes"):
+            bits.append(f"- 维度不一致（已 exclude）: {ds_info['dim_mismatch_episodes']}")
+        if ds_info.get("duration_outlier_episodes"):
+            bits.append(f"- 时长离群（review）: {ds_info['duration_outlier_episodes']}")
+        if ds_info.get("near_duplicate_groups"):
+            bits.append(f"- 近重复集分组（info）: {ds_info['near_duplicate_groups']}")
+        if bits:
+            md += ["", "## 跨集统计", "", *bits]
+        agg = ds_info.get("signals_summary")
+        if agg:
+            md += ["", "## 统计信号（数据级汇总，info 级）", "",
+                   "常量维 = 该维标准差≈0（通道没数据）；僵死维 = 该维多数帧不变（夹爪常见）；"
+                   "静止帧占比 = 全维位移小于阈值的帧比例。", "",
+                   "| 指标 | 值 |", "|---|---|"]
+            for k, v in agg.items():
+                if isinstance(v, dict):
+                    v = " / ".join(f"{kk}:{vv}" for kk, vv in v.items())
+                md.append(f"| {k} | {v} |")
     if joint_obs:
         th = joint_obs.get("thresholds", {})
         md += [
@@ -448,9 +732,14 @@ def _run_dataset_v30(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
                  if do_videos else {})
     ep_rows = []
     ep_joint_obs: list[tuple[int, dict]] = []
+    meta_stats = _parse_meta_stats(ds)
     for ep, df in dataset_io.iter_v3_episodes(ds):
         vsum = vid_by_ep.get(ep, {})
         q = check_episode(df, info, qc, nominal, vsum, check_joints=joints_on)
+        if meta_stats.get(ep):
+            drift = _stats_drift(df, meta_stats[ep], float(qc.get("stats_drift_tol") or 0))
+            if drift:
+                q["reasons_review"].append(drift)
         if not joints_on:
             obs = _joint_observation(df, nominal)
             if obs:
@@ -458,11 +747,11 @@ def _run_dataset_v30(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
         ep_rows.append({"episode": ep, "n_rows": len(df), "_qc": q, "videos": vsum})
 
     ep_rows.sort(key=lambda x: x["episode"])
-    n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
-    n_excl = len(ep_rows) - n_keep
+    ds_info = _dataset_level(ep_rows, ds, qc)
+    _print_counts(ep_rows)
     out_root = Path(args.out) if args.out else dataset_io.new_stage_dir(ds, "clean")
-    return _finalize_qc(ds, out_root, ep_rows, nominal, n_keep, n_excl,
-                        joint_obs=_merge_joint_obs(ep_joint_obs, qc))
+    return _finalize_qc(ds, out_root, ep_rows, nominal,
+                        joint_obs=_merge_joint_obs(ep_joint_obs, qc), ds_info=ds_info)
 
 
 def main() -> int:

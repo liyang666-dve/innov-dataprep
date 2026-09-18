@@ -36,6 +36,15 @@ qc:
   blur_laplacian_thr: 3.0    # 帧 Laplacian 方差阈值（模糊判定，绝对阈值）
   blur_bad_ratio: 0.10       # 低清晰帧占比超过 -> 排除（需 --blur 才启用）
   blur_sample_frames: 200    # 每相机抽帧上限（控成本）
+  # --- 统计信号（review 级：只提示、绝不排除；对标 lerobot-doctor / RDA）---
+  zero_var_eps: 1.0e-6       # 某维标准差小于它 -> 常量维（review，通道没数据）
+  action_spike_sigma: 8.0    # 逐维 |Δ| 超过 8×该维标准差 -> 尖峰（review）
+  action_spike_min_abs: 0.5  # 且绝对跳变 >= 该值(rad) 才算尖峰（避免平滑抖动误报）
+  stuck_dim_ratio: 0.8       # 单维不变帧占比超过 -> 记为僵死维（info，报告里汇总）
+  idle_move_eps: 1.0e-3      # 单帧全维位移小于它算静止
+  idle_ratio_warn: 0.90      # 静止帧占比超过 -> review（有效运动比 <10%）
+  duration_outlier_sigma: 3.0 # 时长偏离均值超过 3σ -> review
+  stats_drift_tol: 0.05      # meta/episodes_stats 与实测均值偏差超过该比例 -> review
 
 doctor:
   # 11 第二意见：lerobot-doctor 只读体检（pip install lerobot-doctor 或 uv tool install）
