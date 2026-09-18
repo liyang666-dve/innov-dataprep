@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 from pipe.lib import dataset_io  # noqa: E402
 from pipe.lib import suggest as _suggest  # noqa: E402  # 仅用于 annotate 的无端点拦截
 
-STEPS = ["inspect", "timestamps", "clean", "doctor", "merge", "convert", "verify", "pack",
+STEPS = ["inspect", "timestamps", "clean", "doctor", "qa", "merge", "convert", "verify", "pack",
          "record", "annotate", "hand_remove"]  # 已实现
 PENDING: list[str] = []           # 规划中（已全部实现）
 
@@ -40,6 +40,7 @@ ACTION_MENU = [
     ("timestamps", "时间戳(02) 审计丢帧/回退"),
     ("clean", "清洗质检(03) 软标记坏集"),
     ("doctor", "第二意见(11) lerobot-doctor 只读体检 → _products/doctor/"),
+    ("qa", "QA汇总(12) 合成交付证据(三档结论) → _products/qa/"),
     ("merge", "合并(05) 勾选若干批次按坏集排除并成一份"),
     ("convert", "转换(06) v2.1→v3.0 官方转换器(自动留 v2.1 备份)"),
     ("verify", "校验(07) 结构smoke + 交付sha256清单"),
@@ -56,6 +57,7 @@ SCRIPTS = {
     "timestamps": "pipe/02_timestamps.py",
     "clean": "pipe/03_clean.py",
     "doctor": "pipe/11_doctor.py",
+    "qa": "pipe/12_qa_report.py",
     "merge": "pipe/05_merge.py",
     "convert": "pipe/06_convert.py",
     "verify": "pipe/07_verify.py",
@@ -276,6 +278,15 @@ def build_action_argv(action: str, allowed: list[dict], cfg: dict, opts: dict | 
         if opts.get("merge_disposition"):
             argv += ["--merge-disposition"]
         return argv
+    if action == "qa":
+        argv = []
+        for info in allowed:
+            argv += ["--input", info["path"]]
+        if (ROOT / "config.yaml").is_file():
+            argv += ["--config", str(ROOT / "config.yaml")]
+        if opts.get("require_doctor"):
+            argv += ["--require-doctor"]
+        return argv
     # inspect / timestamps / clean / hand_remove
     argv = []
     for info in allowed:
@@ -355,7 +366,7 @@ def action_kind_hint(action: str, info: dict) -> str | None:
     """返回该批次执行该动作被挡住的原因；None=允许。自由编排：任意批次都可选中，
     但版本不满足的动作给出明确提示，不静默跳过、也不用 0 集误导。"""
     kind = info.get("kind")
-    if action in ("inspect", "timestamps", "clean", "doctor", "record", "annotate", "verify",
+    if action in ("inspect", "timestamps", "clean", "doctor", "qa", "record", "annotate", "verify",
                   "pack", "hand_remove"):
         return None if kind in ("v2.1", "v3.0") else "该步骤需要 v2.1/v3.0 数据集（exclude 软标记，不删源）"
     if action == "convert":
@@ -454,6 +465,9 @@ def do_action(action: str, selected: list[dict], cfg: dict, args: argparse.Names
             except (EOFError, KeyboardInterrupt):
                 ans = ""
             opts["merge_disposition"] = ans not in ("n", "no")
+    elif action == "qa":
+        if getattr(args, "require_doctor", False):
+            opts["require_doctor"] = True
     elif action == "hand_remove":
         opts["mode"] = args.mode or "blur"
         if args.force_test_hand:
@@ -526,6 +540,8 @@ def main() -> int:
                     help="去手盖板方式（hand_remove 用，默认 blur 模糊）")
     ap.add_argument("--force-test-hand", action="store_true", dest="force_test_hand",
                     help="去手开发自测：无真实手也强制注入遮罩验证链路")
+    ap.add_argument("--require-doctor", action="store_true",
+                    help="qa: 没跑 11 第二意见就判 review")
     ap.add_argument("--aggregate-dir", default=None, help="汇总台账所在目录")
     ap.add_argument("--state", default=None, help="状态文件路径")
     args = ap.parse_args()

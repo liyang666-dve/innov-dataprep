@@ -44,16 +44,29 @@ def build_manifest(ds: Path) -> list[tuple[str, str]]:
     return rows
 
 
-def pack_dataset(ds: Path, out_dir: Path, force: bool = False) -> tuple[Path, Path, int]:
-    """打交付包。返回 (tar 路径, tar.sha256 路径, 文件数)。"""
+def pack_dataset(ds: Path, out_dir: Path, force: bool = False,
+                 qa_md: Path | None = None) -> tuple[Path, Path, int]:
+    """打交付包。返回 (tar 路径, tar.sha256 路径, 文件数)。
+
+    qa_md（可选）：12 的 QA 汇总报告，会以 <ds>/QA.md 放进包内并计入 sha256sums.txt，
+    同时在包旁边留一份 <ds>_QA.md，训练机/台账不用解包也能看结论。
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     tar_p = out_dir / f"{ds.name}_delivery.tar.gz"
     if tar_p.exists() and not force:
         raise FileExistsError(f"{tar_p} 已存在（用 --overwrite 覆盖或换 --out）")
 
     rows = build_manifest(ds)
+    qa_bytes = qa_md.read_bytes() if (qa_md and qa_md.is_file()) else None
+    if qa_bytes is not None:
+        rows.append(("QA.md", hashlib.sha256(qa_bytes).hexdigest()))
     with tarfile.open(tar_p, "w:gz") as tf:
         for rel, _ in rows:
+            if rel == "QA.md" and qa_bytes is not None:
+                ti = tarfile.TarInfo(f"{ds.name}/QA.md")
+                ti.size = len(qa_bytes)
+                tf.addfile(ti, __import__("io").BytesIO(qa_bytes))
+                continue
             tf.add(ds / rel, arcname=f"{ds.name}/{rel}")
         # 清单放数据集根内（路径不含清单自身，保持纯数据清单）
         manifest_bytes = ("\n".join(f"{h}  {rel}" for rel, h in rows) + "\n").encode("utf-8")
@@ -63,6 +76,8 @@ def pack_dataset(ds: Path, out_dir: Path, force: bool = False) -> tuple[Path, Pa
 
     sha_p = out_dir / f"{tar_p.name}.sha256"
     sha_p.write_text(f"{sha256_of_file(tar_p)}  {tar_p.name}\n", encoding="utf-8")
+    if qa_bytes is not None:
+        (out_dir / f"{ds.name}_QA.md").write_bytes(qa_bytes)
     return tar_p, sha_p, len(rows)
 
 
@@ -90,9 +105,14 @@ def main() -> int:
                 print(f"[WARN] 07 校验曾失败（{r.get('n_fail')} 项），建议先跑 07；--force 可跳过")
         else:
             print("[WARN] 未找到 07 校验报告，建议先 python3 pipe/07_verify.py --input <数据集>")
+    qa_md = dataset_io.stage_file(ds, "qa", "qa_summary.md")
+    if qa_md:
+        print(f"[i] 已并入 QA 汇总报告（12）: {qa_md}")
+    else:
+        print("[WARN] 未找到 QA 汇总报告（12），建议先 python3 pipe/12_qa_report.py --input <数据集>")
     try:
         tar_p, sha_p, n_files = pack_dataset(ds, Path(args.out).expanduser() if args.out else ds.parent,
-                                             force=args.overwrite)
+                                             force=args.overwrite, qa_md=qa_md)
     except FileExistsError as e:
         print(f"[ERROR] {e}")
         return 1
@@ -100,6 +120,8 @@ def main() -> int:
     size_mb = tar_p.stat().st_size / 1_048_576
     print(f"[OK] 交付包已生成: {tar_p}")
     print(f"[OK] 大小 {size_mb:.1f} MB / 数据文件 {n_files} 个 / 校验 {sha_p.name}")
+    if qa_md:
+        print(f"[OK] 包内 QA.md + 包旁 {ds.name}_QA.md（sha256 清单已包含 QA.md）")
     print(f"\n训练机整包核验（拷到训练机后执行）:")
     print(f"    sha256sum -c {sha_p.name}")
     print(f"    python3 pipe/07_verify.py --delivery {tar_p.name}")

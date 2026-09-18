@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import sys
 from datetime import date, datetime
@@ -138,6 +139,18 @@ def build_record(summary: dict, cfg: dict, args: argparse.Namespace) -> dict:
     hours = summary["duration_h"]
     avg_min = round(hours * 60 / episodes, 2) if episodes else 0.0
     stats = f"{episodes}集/{summary['total_frames']}帧/{fps}fps/{hours}h"
+    # QA 结论（12）：写进 stats 列，台账列结构不变
+    qa_p = dataset_io.stage_file(Path(summary["path"]), "qa", "qa_summary.json")
+    if qa_p:
+        try:
+            qa = json.loads(qa_p.read_text(encoding="utf-8"))
+            n_rev = int((qa.get("clean_summary") or {}).get("n_review") or 0)
+            n_ex = int((qa.get("clean_summary") or {}).get("n_exclude") or 0)
+            stats += f"/QA:{qa.get('verdict')}(rev{n_rev},exc{n_ex})"
+        except Exception:  # noqa: BLE001
+            pass
+    else:
+        stats += "/QA:-"
 
     stage = args.stage
     quality = args.quality or ("clean" if stage == "final" else "raw")

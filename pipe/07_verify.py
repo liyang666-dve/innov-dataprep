@@ -302,6 +302,13 @@ def verify_delivery(pkg: Path, args: argparse.Namespace) -> int:
                 print(f"[ERROR] 交付包 {bad} 个文件校验失败，包可能损坏")
                 return 1
             print(f"[OK] sha256 逐文件比对通过（{len([l for l in manifest[0].read_text(encoding='utf-8').splitlines() if l.strip()])} 个文件）")
+        qa = ds_root / "QA.md"
+        if qa.is_file():
+            first = next((ln.strip() for ln in qa.read_text(encoding="utf-8").splitlines()
+                          if ln.strip().startswith("**结论")), "")
+            print(f"[i] 包内 QA 汇总: {qa.name} {first or '（见文件）'}")
+        else:
+            print("[WARN] 包内无 QA.md（交付前建议跑 12 汇总 QA 证据）")
         r = verify_dataset(ds_root)
         print("")
         for ln in fmt_report(r):

@@ -62,18 +62,20 @@ python3 web/app.py                   # 本地 Web：默认 http://127.0.0.1:8000
 
 ## 4. 处理与登记流程
 
-**规则**：想处理哪批就处理哪批、想合并哪些就合并哪些。每批采完先**轻检查**（01/02/03，只报告、软标记坏集、**绝不删数据**）→ 你**显式指定**的若干批次**合并**成一个集（自动排除坏集）→ 合并后统一标注/清洗 → **转 v3.0**（v2.1 自动备份 `<名字>_old`）→ **07 校验**（结构 smoke + sha256）→ **08 打包**（tar.gz 交付）→ 训练机核验后直训。
+**规则**：想处理哪批就处理哪批、想合并哪些就合并哪些。每批采完先**轻检查**（01/02/03，只报告、软标记坏集、**绝不删数据**）→ 你**显式指定**的若干批次**合并**成一个集（自动排除坏集）→ 合并后统一标注/清洗 → **转 v3.0**（v2.1 自动备份 `<名字>_old`）→ **07 校验**（结构 smoke + sha256）→ **12 QA 汇总**（把 01/02/03/07/11 的结论合成一份三档结论）→ **08 打包**（tar.gz 交付，包内带 `QA.md`）→ 训练机核验后直训。
 
 - **输入布局**：标准 v2.1（`meta/` + `data/chunk-*/episode_*.parquet` + `videos/chunk-*/<cam>/*.mp4`）；转换后的 v3.0 同可被 01/02/03/标注/登记处理。
 - **合并（05）**：勾选 ≥2 个 v2.1 批次；自动按各批清洗清单（`<批>_products/clean/episode_disposition.csv`，兼容旧 `<批>_clean/`）排除坏集；机型/帧率/features 不一致会拒绝；输出自动命名 `{task}_{robot}_{MMDD[-MMDD]}_{N}cam_v{ver}`，已存在会拦截（`--overwrite` 覆盖）。
 - **质检三档判定（03）**：`exclude`（硬伤：文件对不上/NaN/维度不一致 → 05 合并剔除）/ `review`（需人看：常量维、动作尖峰、静止帧占比、时长离群、stats 漂移 → 05 **不剔除**，进 Web 盲审页）/ `keep`。另有 info 级统计信号（僵死维、有效运动比、最大跳变 Top3）只进报告，不参与判定——阈值未定标前绝不杀数据。
 - **第二意见（11）**：包装官方生态的 `lerobot-doctor`（只读 `check`）做独立体检——补上自研 03 覆盖不到的 action 级异常（尖峰/僵死/零方差维度/策略兼容性/URDF 动力学/per-episode 明细）。默认把被点名的 `keep` 集降级为 `review`（05 只排除 `exclude`，`review` 不会被删），**绝不自动排除**；也绝不调用 doctor 的 `fix`/`trim`（那两个会改数据）。装不上就让这一步跳过，不影响其它步骤。
+- **QA 汇总（12）**：把一次数据集的所有证据（03 逐集判定 + 11 第二意见 + 07 校验 + 02 时间戳 + 交付包）合成 `<ds>_products/qa/qa_summary.{md,json}`，给出**一个结论**：`ready` / `review` / `blocked`（blocked = doctor FAIL / 07 不过 / 没跑 03；review = 有 review 集或 doctor WARN）。`--fail-on review` 可当门禁（非 0 退出）。08 打包会把 `qa_summary.md` 作为 `<ds>/QA.md` 放进交付包并计入 sha256 清单，同时在包旁留一份 `<ds>_QA.md`；登记时 QA 结论写进台账 `stats` 列（如 `93集/70958帧/30fps/0.66h/QA:review(rev2,exc3)`），台账列结构不变。
+- **阈值定标（`tools/calibrate_qc.py`，只读）**：03 的关节/尖峰阈值不该拍脑袋——实测你 0730 两批各 15 集得出的建议是 `joint_jump_rad=2.37` / `stuck_s=28.5` / `zero_var_eps=0.006` / `action_spike_min_abs=0.47`，而旧默认 0.8 / 0.4 在真实数据上必然大量误杀。跑 `python3 tools/calibrate_qc.py --dir <批次目录> --max-episodes 0` 出报告 + `qc_suggested.yaml`，人工确认后再粘进 config。
 - **转换（06，仅采集机）**：包装官方 `convert_dataset_v21_to_v30.py`（自动探测调用方式）；`--push-to-hub=false` 本地转；官方转换器需要 `meta/episodes_stats.jsonl`，缺时自动补算；`--check` 先预检再转。
 - **标注（09）**：VLM（OpenAI 兼容接口，可接 DeepSeek/通义）逐集评分+建议，**只读**；未启用/缺 Key 会明确拦截。
 - **登记（默认时机：数据处理达标后）**：`--stage final`（默认，质量 `clean`，一条台账 = 一个最终数据）；`--stage raw`（可选，每原始批次一行）。防呆：非 v2.1/v3.0、空数据集、假日期、批次号重复都会拦截。
 - 台账字段：`batch_id / task / date / robot / machine / operator / version / episodes / total_frames / fps / duration_h / avg_duration_min / sensors / format / quality / stage / source / stats / note / registered_at`（几乎全自动推导，人工只需确认操作员/采集机/备注）。
 
-**处理产物布局**：各阶段产物统一收进数据集旁唯一产品夹 `<名字>_products/{阶段}/`（inspect / timestamps / clean / annotation）；旧平铺布局（`<名字>_inspect/` 等）仍可读，可跑 `pipe/migrate_products.py` 一次性收拢（`--dry-run` 预览）。
+**处理产物布局**：各阶段产物统一收进数据集旁唯一产品夹 `<名字>_products/{阶段}/`（inspect / timestamps / clean / doctor / qa / verify / annotation）；旧平铺布局（`<名字>_inspect/` 等）仍可读，可跑 `pipe/migrate_products.py` 一次性收拢（`--dry-run` 预览）。
 
 ## 5. 在别的电脑克隆即用（依赖分档）
 
@@ -86,6 +88,7 @@ python3 web/app.py                   # 本地 Web：默认 http://127.0.0.1:8000
 | 03 `--blur` 模糊检查 | opencv | setup.sh 可选行自动尝试装 |
 | 06 转换 v2.1→v3.0 | **lerobot 环境** | **只用采集机能跑**（conda `lerobot_arx_sdk311`）；其他机器会明确报错提示 |
 | 09 VLM 标注 | 仅标准库 + 网络 + API Key | 配好 config annotate 段即可 |
+| 12 QA 汇总 | 无（纯标准库） | 读上面的产物合成结论；缺哪个阶段就少一行依据，不报错 |
 | 11 第二意见 | `lerobot-doctor`（本仓库不打包） | `uv tool install lerobot-doctor` 或 `pip install --user lerobot-doctor`；找不到时报错跳过 |
 | Web（回放/盲审/台账） | flask（回放另需 rerun-sdk） | setup.sh 可选行自动装；不跑 Web 可忽略 |
 
@@ -100,11 +103,12 @@ innov-dataprep/
 │   ├── lib/                    # dataset_io(识别/摘要/产物布局) video_utils(ffprobe)
 │   │                           # report suggest(VLM引擎) replay(回放)
 │   ├── 01_inspect.py 02_timestamps.py 03_clean.py   # 轻检查（只读）
-│   ├── 05_merge.py 06_convert.py 07_verify.py 08_pack.py 09_annotate.py 11_doctor.py
+│   ├── 05_merge.py 06_convert.py 07_verify.py 08_pack.py 09_annotate.py
+│   ├── 11_doctor.py 12_qa_report.py   # 第二意见 / QA 汇总（只读）
 │   └── migrate_products.py     # 旧平铺产物 → _products/ 一次性迁移
 ├── web/                        # Flask 本地界面（app.py 入口 + backend.py API）
 ├── ledger/record.py aggregate.py   # 登记卡 / 台账汇总
-├── tools/make_demo_data.py check_config.py self_test.sh
+├── tools/make_demo_data.py calibrate_qc.py check_config.py self_test.sh
 ├── config.example.yaml setup.sh requirements.txt pyproject.toml
 └── LICENSE (Apache-2.0)
 ```
@@ -125,7 +129,9 @@ python3 tools/check_config.py        # 配置体检
 - [x] 09 标注（VLM，config 门禁）· Web 界面（回放/盲审/台账/一键动作）
 - [x] 07 校验（结构 smoke + 数据集/交付包 sha256，`--delivery` 整包核验）· 08 打包（tar.gz + sha256sums.txt）
 - [x] 登记 + 台账汇总 + 操作留痕 · 产物布局统一（_products/ + 迁移脚本）
-- [x] **全流程已实现**（01→08 闭环；只剩真实数据上的阈值定标与端到端验证）
+- [x] **统计信号 + 三档判定（2026-09）**：常量维/动作尖峰/僵死维/有效运动比/时长离群/stats 漂移内建进 03（不依赖第三方），review 进 Web 盲审页
+- [x] 12 QA 汇总（三档结论 + `--fail-on` 门禁）· 交付包内带 `QA.md` · 台账 stats 记 QA 结论 · `tools/calibrate_qc.py` 阈值定标
+- [x] **全流程已实现**（01→08 + QA 闭环；只剩真实数据上的端到端验证与可选 RDA 接入）
 
 ## 9. License
 
