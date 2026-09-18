@@ -69,6 +69,7 @@ python3 web/app.py                   # 本地 Web：默认 http://127.0.0.1:8000
 - **质检三档判定（03）**：`exclude`（硬伤：文件对不上/NaN/维度不一致 → 05 合并剔除）/ `review`（需人看：常量维、动作尖峰、静止帧占比、时长离群、stats 漂移 → 05 **不剔除**，进 Web 盲审页）/ `keep`。另有 info 级统计信号（僵死维、有效运动比、最大跳变 Top3）只进报告，不参与判定——阈值未定标前绝不杀数据。
 - **第二意见（11）**：包装官方生态的 `lerobot-doctor`（只读 `check`）做独立体检——补上自研 03 覆盖不到的 action 级异常（尖峰/僵死/零方差维度/策略兼容性/URDF 动力学/per-episode 明细）。默认把被点名的 `keep` 集降级为 `review`（05 只排除 `exclude`，`review` 不会被删），**绝不自动排除**；也绝不调用 doctor 的 `fix`/`trim`（那两个会改数据）。装不上就让这一步跳过，不影响其它步骤。
 - **QA 汇总（12）**：把一次数据集的所有证据（03 逐集判定 + 11 第二意见 + 07 校验 + 02 时间戳 + 交付包）合成 `<ds>_products/qa/qa_summary.{md,json}`，给出**一个结论**：`ready` / `review` / `blocked`（blocked = doctor FAIL / 07 不过 / 没跑 03；review = 有 review 集或 doctor WARN）。`--fail-on review` 可当门禁（非 0 退出）。08 打包会把 `qa_summary.md` 作为 `<ds>/QA.md` 放进交付包并计入 sha256 清单，同时在包旁留一份 `<ds>_QA.md`；登记时 QA 结论写进台账 `stats` 列（如 `93集/70958帧/30fps/0.66h/QA:review(rev2,exc3)`），台账列结构不变。
+- **阈值怎么来的 / 怎么自查（2026-09 实测）**：三类来源——① 物理基线（帧率偏差/丢帧比/时长安全网）② 对齐官方生态口径（尖峰 8σ、时长 3σ 离群、stats 漂移 5%）③ **必须用自己数据定标**（关节限位/跳变/卡死、尖峰绝对下限、常量维）。用注入缺陷实测过敏感性：NaN→exclude、常量维→review、9% 丢帧→exclude、视频少帧→exclude、重模糊→exclude、95% 静止→review、stats 漂移→review 都抓得住；同时修掉两个真问题——**关节超限位时曾 IndexError 崩溃**（展平索引当列号用）、**stats 漂移在"逐列键"与 v3.0 存法下静默失效**（现支持三种存法）。单帧跳变加了 `joint_jump_review_rad`（默认 0.8）：定标把排除线放宽到 3.05 后，0.8~3.05 rad 的单帧跳变仍会进 review 而不是被放过。
 - **阈值定标（`tools/calibrate_qc.py`，只读）**：03 的关节/尖峰阈值不该拍脑袋——实测你 0730 两批各 15 集得出的建议是 `joint_jump_rad=2.37` / `stuck_s=28.5` / `zero_var_eps=0.006` / `action_spike_min_abs=0.47`，而旧默认 0.8 / 0.4 在真实数据上必然大量误杀。跑 `python3 tools/calibrate_qc.py --dir <批次目录> --max-episodes 0` 出报告 + `qc_suggested.yaml`，人工确认后再粘进 config。
 - **转换（06，仅采集机）**：包装官方 `convert_dataset_v21_to_v30.py`（自动探测调用方式）；`--push-to-hub=false` 本地转；官方转换器需要 `meta/episodes_stats.jsonl`，缺时自动补算；`--check` 先预检再转。
 - **标注（09）**：VLM（OpenAI 兼容接口，可接 DeepSeek/通义）逐集评分+建议，**只读**；未启用/缺 Key 会明确拦截。
@@ -131,6 +132,7 @@ python3 tools/check_config.py        # 配置体检
 - [x] 登记 + 台账汇总 + 操作留痕 · 产物布局统一（_products/ + 迁移脚本）
 - [x] **统计信号 + 三档判定（2026-09）**：常量维/动作尖峰/僵死维/有效运动比/时长离群/stats 漂移内建进 03（不依赖第三方），review 进 Web 盲审页
 - [x] 12 QA 汇总（三档结论 + `--fail-on` 门禁）· 交付包内带 `QA.md` · 台账 stats 记 QA 结论 · `tools/calibrate_qc.py` 阈值定标
+- [x] 阈值敏感性实测 + 两个真 bug 修复（关节超限位崩溃、stats 漂移在逐列键/v3.0 存法下失效）+ 跳变复核线兜底
 - [x] **全流程已实现**（01→08 + QA 闭环；只剩真实数据上的端到端验证与可选 RDA 接入）
 
 ## 9. License

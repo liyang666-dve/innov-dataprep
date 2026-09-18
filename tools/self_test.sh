@@ -30,6 +30,42 @@ C_EXC=$(F="$TMP/out_clean/summary.json" K=n_exclude "$PYTHON_BIN" -c "import jso
 [ "$D_EXC" = "5" ] && ok "脏集排除数=5（实际 $D_EXC）" || bad "脏集排除数应为 5，实际 $D_EXC"
 [ "$C_EXC" = "0" ] && ok "干净集排除数=0（实际 $C_EXC）" || bad "干净集排除数应为 0，实际 $C_EXC"
 
+# 回归：关节值真的超限位时，03 必须正常报告（历史 bug：这里会 IndexError 崩溃）
+cp -r "$TMP/clean" "$TMP/overlimit"
+"$PYTHON_BIN" - "$TMP/overlimit" <<'PYOL'
+import glob, sys
+import pandas as pd
+p = sorted(glob.glob(sys.argv[1] + "/data/chunk-*/*.parquet"))[0]
+df = pd.read_parquet(p)
+col = [c for c in df.columns if c.startswith("observation.state.")][0]
+df.loc[1, col] = 4.0
+df.to_parquet(p, index=False)
+PYOL
+"$PYTHON_BIN" pipe/03_clean.py --input "$TMP/overlimit" --out "$TMP/out_overlimit" \
+  --config "$CFG_NONE" --joints >/dev/null 2>&1
+RC_OL=$?
+if [ $RC_OL -eq 0 ] && grep -q "超限位" "$TMP/out_overlimit/episode_disposition.csv" 2>/dev/null; then
+  ok "03 关节超限位正常报告 excl(不崩溃)"
+else
+  bad "03 遇超限位应报 exclude，实际 rc=$RC_OL"
+fi
+# 回归：单帧大跳变（未到排除线）必须进 review，不能被静默放过
+cp -r "$TMP/clean" "$TMP/jump_rev"
+"$PYTHON_BIN" - "$TMP/jump_rev" <<'PYJR'
+import glob, sys
+import pandas as pd
+p = sorted(glob.glob(sys.argv[1] + "/data/chunk-*/*.parquet"))[0]
+df = pd.read_parquet(p)
+col = [c for c in df.columns if c.startswith("observation.state.")][0]
+df.loc[2, col] = float(df[col].iloc[1]) + 1.5
+df.to_parquet(p, index=False)
+PYJR
+printf 'qc:\n  joint_jump_rad: 3.05\n  joint_jump_review_rad: 0.8\n' > "$TMP/qc_cal.yaml"
+"$PYTHON_BIN" pipe/03_clean.py --input "$TMP/jump_rev" --out "$TMP/out_jump_rev" \
+  --config "$TMP/qc_cal.yaml" --joints >/dev/null 2>&1
+grep -q "复核线" "$TMP/out_jump_rev/episode_disposition.csv" 2>/dev/null \
+  && ok "03 定标后单帧 1.5rad 跳变进 review(复核线生效)" || bad "定标后 1.5rad 跳变应进 review（未到 3.05 排除线）"
+
 echo "== 3/12 01 盘点 / 02 时间戳 可跑通 =="
 "$PYTHON_BIN" pipe/01_inspect.py --input "$TMP/dirty" >/dev/null 2>&1 && ok "01 盘点" || bad "01 盘点失败"
 "$PYTHON_BIN" pipe/02_timestamps.py --input "$TMP/dirty" >/dev/null 2>&1 && ok "02 时间戳" || bad "02 时间戳失败"

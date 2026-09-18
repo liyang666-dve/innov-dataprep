@@ -46,7 +46,8 @@ DEFAULT_QC = {
     "fps_deviation": 0.15,        # 实际帧率与标称偏差 -> exclude
     "max_drop_ratio": 0.05,       # 丢帧估计/行数 -> exclude
     "joint_limits_rad": 3.3,      # |关节角| 超限 -> exclude
-    "joint_jump_rad": 0.8,        # 相邻帧跳变 -> exclude
+    "joint_jump_rad": 0.8,        # 相邻帧跳变 -> exclude（定标后通常远大于此值）
+    "joint_jump_review_rad": 0.8, # 单帧跳变复核线 -> review（低于排除线时兜底，防漏判）
     "stuck_s": 0.4,               # 关节零方差持续 -> exclude
     "blur_laplacian_thr": 3.0,    # 帧 Laplacian 方差阈值（绝对）
     "blur_bad_ratio": 0.10,       # 低于阈值的帧占比 -> exclude
@@ -167,51 +168,98 @@ def _fingerprint(df: "pd.DataFrame") -> str | None:
 
 
 def _parse_meta_stats(ds: Path) -> dict[int, dict]:
-    """读 meta/episodes_stats.jsonl（用于 stats 漂移检查）；缺失返回 {}。"""
-    p = ds / "meta" / "episodes_stats.jsonl"
-    if not p.is_file():
-        return {}
+    """读 meta 里的逐集统计，兼容三种存法：
+      1) v2.1（robodeploy）：meta/episodes_stats.jsonl，聚合键 stats["action"]["mean"] = [14 个数]
+      2) v2.1（别的生成器）：同文件但**逐列键** stats["action.left_0"]["mean"] = 标量
+      3) v3.0：meta/episodes/chunk-*/file-*.parquet 里的 stats/<feature>/<stat> 列
+    返回 {episode_index: {键: {"mean":…, "std":…}}}；读不到返回 {}（调用方跳过该检查）。
+    """
     out: dict[int, dict] = {}
+    p = ds / "meta" / "episodes_stats.jsonl"
+    if p.is_file():
+        try:
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        r = json.loads(line)
+                        out[int(r["episode_index"])] = r.get("stats") or {}
+        except Exception:  # noqa: BLE001
+            return {}
+        return out
+
+    eps_files = sorted((ds / "meta" / "episodes").glob("chunk-*/*.parquet"))
+    if not eps_files:
+        return out
     try:
-        with open(p, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                r = json.loads(line)
-                out[int(r["episode_index"])] = r.get("stats") or {}
+        import pyarrow.parquet as pq
+        for fp in eps_files:
+            tbl = pq.read_table(fp)
+            names = list(tbl.schema.names)
+            stat_cols = [n for n in names if n.startswith("stats/") and n.count("/") == 2]
+            feats = sorted({n.split("/")[1] for n in stat_cols})
+            eps = tbl.column("episode_index").to_pylist() if "episode_index" in names else []
+            data = {n: tbl.column(n).to_pylist() for n in stat_cols}
+            for row, ep in enumerate(eps):
+                st: dict = {}
+                for feat in feats:
+                    d: dict = {}
+                    for stat in ("min", "max", "mean", "std", "count"):
+                        col = f"stats/{feat}/{stat}"
+                        if col in data and row < len(data[col]):
+                            d[stat] = data[col][row]
+                    if d:
+                        st[feat] = d
+                out[int(ep)] = st
     except Exception:  # noqa: BLE001
         return {}
     return out
 
 
+def _stats_lookup(stats: dict, cols: list[str]) -> dict[str, tuple[float, float]]:
+    """把三种存法统一成 {列名: (均值, 标准差)}，用于与实测比对。"""
+    res: dict[str, tuple[float, float]] = {}
+    for prefix in ("observation.state", "action"):
+        sub = [c for c in cols if c.startswith(prefix + ".")]
+        agg = stats.get(prefix)
+        if sub and isinstance(agg, dict) and isinstance(agg.get("mean"), list) \
+                and len(agg["mean"]) == len(sub):
+            std = agg.get("std") if isinstance(agg.get("std"), list) else []
+            for i, c in enumerate(sub):
+                res[c] = (float(agg["mean"][i]), float(std[i]) if i < len(std) else 0.0)
+    for c in cols:                                  # 逐列键（标量或长度 1 列表）
+        v = stats.get(c)
+        if isinstance(v, dict) and c not in res:
+            m, sd = v.get("mean"), v.get("std")
+            m = m[0] if isinstance(m, list) and m else m
+            sd = sd[0] if isinstance(sd, list) and sd else sd
+            if isinstance(m, (int, float)):
+                res[c] = (float(m), float(sd) if isinstance(sd, (int, float)) else 0.0)
+    return res
+
+
 def _stats_drift(df: "pd.DataFrame", stats: dict, tol: float) -> str | None:
-    """meta 里的 stats 均值与实测均值偏差（超过 tol×该维标准差 -> 提示）。"""
+    """meta 里的 stats 均值与实测均值比对（偏差 > tol×该维标准差 -> 提示）。
+
+    以**该维标准差**为尺度：常量维（std=0）不参与（由零方差维负责）。
+    """
     if not stats or not tol:
         return None
-    worst = 0.0
-    worst_key = ""
-    for prefix in ("observation.state", "action"):
-        cols = [c for c in df.columns if c.startswith(prefix + ".")]
-        st = stats.get(prefix)
-        if not cols or not isinstance(st, dict):
-            continue
-        X = df[cols].to_numpy(dtype=np.float64)
-        if not X.size:
-            continue
-        with np.errstate(all="ignore"):
-            cur = np.nanmean(X, axis=0)
-            ref = np.asarray(st.get("mean") or [], dtype=np.float64)
-            scale = np.asarray(st.get("std") or [], dtype=np.float64)
-        if ref.shape != cur.shape:
-            continue
-        scale = np.where(np.abs(scale) < 1e-9, 1.0, np.abs(scale))
-        rel = np.abs(cur - ref) / scale
-        if rel.size and float(np.nanmax(rel)) > worst:
-            worst = float(np.nanmax(rel))
-            worst_key = f"{prefix} dim{int(np.nanargmax(rel))}"
+    cols = [c for c in df.columns if c not in dataset_io.KEY_COLUMNS and df[c].dtype.kind in "fc"]
+    ref_map = _stats_lookup(stats, cols)
+    if not ref_map:
+        return None
+    worst, worst_key = 0.0, ""
+    with np.errstate(all="ignore"):
+        for c, (ref, ref_std) in ref_map.items():
+            if abs(ref_std) <= 1e-9:
+                continue
+            cur = float(np.nanmean(df[c].to_numpy(dtype=np.float64)))
+            rel = abs(cur - ref) / abs(ref_std)
+            if rel > worst:
+                worst, worst_key = rel, f"{c}(实测 {cur:.3f} vs stats {ref:.3f})"
     if worst > tol:
-        return f"stats 与实测不符（{worst_key} 偏差 {worst:.0%} > {tol:.0%}，meta/episodes_stats.jsonl 可能是旧值）"
+        return f"stats 与实测不符：{worst_key} 偏差 {worst:.0%} > {tol:.0%}（meta 里可能是旧值）"
     return None
 
 
@@ -287,15 +335,21 @@ def check_episode(df: pd.DataFrame, meta_info: dict, qc: dict, nominal_fps: floa
         with np.errstate(all="ignore"):
             lim = qc["joint_limits_rad"]
             if lim and (np.nanmax(np.abs(J)) if J.size else 0) > lim:
-                worst = int(np.nanargmax(np.abs(J))) if J.size else 0
-                exclude.append(f"关节超限位 {np.nanmax(np.abs(J)):.2f}rad > {lim} (列 {joint_cols[worst]})")
+                flat = int(np.nanargmax(np.abs(J))) if J.size else 0
+                worst = flat % max(1, J.shape[1])      # 展平索引 -> 列号（原实现少取模会 IndexError）
+                exclude.append(f"关节超限位 {np.nanmax(np.abs(J)):.2f}rad > {lim} "
+                               f"(列 {joint_cols[worst]} 第 {flat // max(1, J.shape[1])} 帧)")
             jd = np.abs(np.diff(J, axis=0))
             thr = qc["joint_jump_rad"]
+            thr_rev = float(qc.get("joint_jump_review_rad") or 0)
             if jd.size:
-                mj = np.nanmax(jd) if jd.size else 0.0
+                mj = float(np.nanmax(jd))
+                col = int(np.nanargmax(jd) % jd.shape[1])
                 if mj > thr:
-                    col = int(np.nanargmax(jd) % jd.shape[1]) if jd.size else 0
                     exclude.append(f"关节跳变 {mj:.2f}rad > {thr} (列 {joint_cols[col]})")
+                elif thr_rev and mj > thr_rev:
+                    review.append(f"关节单帧跳变 {mj:.2f}rad > 复核线 {thr_rev}"
+                                  f"（未到排除线 {thr}，列 {joint_cols[col]}）")
             # 卡死：任一行在 diff==0 连续最长
             eq = np.diff(J, axis=0) == 0
             med_dt = np.nanmedian(d) if has_ts and t.size >= 2 else 1.0 / nominal_fps
