@@ -33,6 +33,9 @@ qc:
   joint_limits_rad: 3.3      # |关节角| 超过 -> 排除
   joint_jump_rad: 0.8        # 相邻帧跳变超过(rad) -> 排除
   stuck_s: 0.4               # 关节零方差持续超过 -> 排除
+  # ⚠ 上面三项关节阈值是"未定标"的保守默认：真实 ARX 数据上照着跑 --joints 会把 93/93 集
+  #   全判排除。先跑 `python3 tools/calibrate_qc.py --dir <批次目录> --max-episodes 0`，
+  #   把 qc_suggested.yaml 的值粘回来（本机 13 批实测：joint_jump_rad=3.05 / stuck_s=55.1）
   blur_laplacian_thr: 3.0    # 帧 Laplacian 方差阈值（模糊判定，绝对阈值）
   blur_bad_ratio: 0.10       # 低清晰帧占比超过 -> 排除（需 --blur 才启用）
   blur_sample_frames: 200    # 每相机抽帧上限（控成本）

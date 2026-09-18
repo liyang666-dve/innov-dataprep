@@ -136,10 +136,14 @@ def suggest(scans: list[dict]) -> dict[str, Any]:
         sug["stuck_s"] = round(max(r["longest_stuck_s"] for r in st) * 1.5, 1)
     if ac:
         sug["action_spike_min_abs"] = round(_p99max(ac, "step_p999_per_dim") * 2.0, 2)
+    # 常量维阈值：真正"没有数据"的通道 std 恰好为 0，传感器噪声远大于 1e-6，
+    # 所以这里不按分位数放大（放大反而会把"动得少的真关节"误判成常量维），
+    # 只报告是否存在"近死通道"（极小但非零的 std）供人工判断。
     stds_min = [min(r["std_min_per_dim"]) for r in (st + ac) if r.get("std_min_per_dim")]
     nz = [v for v in stds_min if v > 0]
-    if nz:
-        sug["zero_var_eps"] = float(f"{min(nz) / 10:.1e}")
+    sug["zero_var_eps"] = 1e-6
+    if nz and min(nz) < 1e-3:
+        sug["_warn_near_dead_channels"] = f"最小非零逐维 std={min(nz):.2e}（<1e-3，疑似近死通道，人工确认）"
     idle_max = max([r.get("idle_ratio_max") or 0 for r in (st + ac)] or [0])
     sug["idle_ratio_warn"] = round(min(0.98, max(0.90, idle_max + 0.1)), 2)
     dur = [s["duration_s"] for s in scans if s.get("duration_s")]
@@ -194,8 +198,12 @@ def main() -> int:
     yaml_lines = ["# 由 tools/calibrate_qc.py 生成 —— 人工确认后再粘贴进 config.yaml 的 qc: 段",
                   "# 原则：以观测最大值为下界（宁可放过，不可误杀）；粘贴后可用 --joints 打开关节类判定", "",
                   "qc:"]
+    warns = [v for k, v in sug.items() if k.startswith("_warn")]
     for k, v in sug.items():
-        yaml_lines.append(f"  {k}: {v}")
+        if not k.startswith("_warn"):
+            yaml_lines.append(f"  {k}: {v}")
+    if warns:
+        yaml_lines.insert(3, "# \u26a0 " + "；".join(warns))
     (out_root / "qc_suggested.yaml").write_text("\n".join(yaml_lines) + "\n", encoding="utf-8")
 
     md = ["# qc 阈值定标报告", "",
