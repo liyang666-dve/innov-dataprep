@@ -37,6 +37,11 @@ qc:
   blur_bad_ratio: 0.10       # 低清晰帧占比超过 -> 排除（需 --blur 才启用）
   blur_sample_frames: 200    # 每相机抽帧上限（控成本）
 
+doctor:
+  # 11 第二意见：lerobot-doctor 只读体检（pip install lerobot-doctor 或 uv tool install）
+  bin: ""                    # lerobot-doctor 可执行文件路径；留空=从 PATH 找
+  max_episodes: 20           # 只检查前 N 集（大集强烈建议；留空/0=全部）
+
 annotate:
   # —— 09 标注：VLM 逐集质量评分+建议（采集机能联网时启用；OpenAI 兼容接口，可填 DeepSeek/通义）——
   #    enabled: true 后还需填 base_url / model / api_key_env（环境变量名，存放 API Key）

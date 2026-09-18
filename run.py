@@ -31,7 +31,7 @@ sys.path.insert(0, str(ROOT))
 from pipe.lib import dataset_io  # noqa: E402
 from pipe.lib import suggest as _suggest  # noqa: E402  # 仅用于 annotate 的无端点拦截
 
-STEPS = ["inspect", "timestamps", "clean", "merge", "convert", "verify", "pack",
+STEPS = ["inspect", "timestamps", "clean", "doctor", "merge", "convert", "verify", "pack",
          "record", "annotate", "hand_remove"]  # 已实现
 PENDING: list[str] = []           # 规划中（已全部实现）
 
@@ -39,6 +39,7 @@ ACTION_MENU = [
     ("inspect", "盘点(01) 每集统计/视频对齐"),
     ("timestamps", "时间戳(02) 审计丢帧/回退"),
     ("clean", "清洗质检(03) 软标记坏集"),
+    ("doctor", "第二意见(11) lerobot-doctor 只读体检 → _products/doctor/"),
     ("merge", "合并(05) 勾选若干批次按坏集排除并成一份"),
     ("convert", "转换(06) v2.1→v3.0 官方转换器(自动留 v2.1 备份)"),
     ("verify", "校验(07) 结构smoke + 交付sha256清单"),
@@ -54,6 +55,7 @@ SCRIPTS = {
     "inspect": "pipe/01_inspect.py",
     "timestamps": "pipe/02_timestamps.py",
     "clean": "pipe/03_clean.py",
+    "doctor": "pipe/11_doctor.py",
     "merge": "pipe/05_merge.py",
     "convert": "pipe/06_convert.py",
     "verify": "pipe/07_verify.py",
@@ -265,6 +267,15 @@ def build_action_argv(action: str, allowed: list[dict], cfg: dict, opts: dict | 
         if opts.get("overwrite"):
             argv += ["--overwrite"]
         return argv
+    if action == "doctor":
+        argv = []
+        for info in allowed:
+            argv += ["--input", info["path"]]
+        if (ROOT / "config.yaml").is_file():
+            argv += ["--config", str(ROOT / "config.yaml")]
+        if opts.get("merge_disposition"):
+            argv += ["--merge-disposition"]
+        return argv
     # inspect / timestamps / clean / hand_remove
     argv = []
     for info in allowed:
@@ -344,8 +355,8 @@ def action_kind_hint(action: str, info: dict) -> str | None:
     """返回该批次执行该动作被挡住的原因；None=允许。自由编排：任意批次都可选中，
     但版本不满足的动作给出明确提示，不静默跳过、也不用 0 集误导。"""
     kind = info.get("kind")
-    if action in ("inspect", "timestamps", "clean", "record", "annotate", "verify", "pack",
-                  "hand_remove"):
+    if action in ("inspect", "timestamps", "clean", "doctor", "record", "annotate", "verify",
+                  "pack", "hand_remove"):
         return None if kind in ("v2.1", "v3.0") else "该步骤需要 v2.1/v3.0 数据集（exclude 软标记，不删源）"
     if action == "convert":
         if kind == "v3.0":
@@ -431,6 +442,18 @@ def do_action(action: str, selected: list[dict], cfg: dict, args: argparse.Names
                 ans = ""
             stage = "raw" if ans == "2" else "final"
         opts["stage"] = stage or "final"
+    elif action == "doctor":
+        # 默认联动：把被点名的 keep 集降级为 review（不删数据）
+        if args.no_merge_disposition:
+            opts["merge_disposition"] = False
+        elif not sys.stdin.isatty():
+            opts["merge_disposition"] = True
+        else:
+            try:
+                ans = input("把 doctor 点名的 keep 集降级为 review? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                ans = ""
+            opts["merge_disposition"] = ans not in ("n", "no")
     elif action == "hand_remove":
         opts["mode"] = args.mode or "blur"
         if args.force_test_hand:
@@ -493,6 +516,8 @@ def main() -> int:
     ap.add_argument("indices", nargs="*", help="数据编号（list 里看到的），如 1,3")
     ap.add_argument("--path", default=None, help="扫描哪个目录（默认 config paths.batches）")
     ap.add_argument("--dirs", nargs="+", default=None, help="直接给数据集路径，跳过扫描")
+    ap.add_argument("--no-merge-disposition", action="store_true",
+                    help="doctor: 不改 episode_disposition.csv（只出报告）")
     ap.add_argument("--stage", choices=["final", "raw"], default=None, help="record 阶段")
     ap.add_argument("--output", default=None, help="合并输出目录（merge 用，默认自动命名）")
     ap.add_argument("--overwrite", action="store_true", help="覆盖已存在的输出（merge/pack 用）")

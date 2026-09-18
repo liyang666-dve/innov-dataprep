@@ -4,14 +4,20 @@
 铁律：本脚本不删除/修改任何数据文件。坏集只在报告中标记 exclude，
 真正的过滤发生在 05_merge（按 episode_disposition.csv 排除）。
 
-产出（写入 <输入父目录>/<名字>_clean/）:
-  - qc_report.md            人类可读报告
+数组列说明（2026-09 审计后修复）：真实 robodeploy v2.1 把 action / observation.state
+存成"每行一个数组"的 object 列，历史实现按 dtype/点分前缀选列 → NaN/Inf、关节类检查
+在真实数据上完全不触发。现改为先 expand_array_features() 展开成 action.0…N 再检查，
+v2.1 与 v3.0 行为一致。关节类判定因数组列没有关节名（无法豁免夹爪）默认关闭，
+只输出「关节观测量」供定标，加 --joints 才参与 keep/exclude。
+
+产出（写入 <输入父目录>/<名字>_products/clean/）:
+  - qc_report.md            人类可读报告（含关节观测量）
   - episode_disposition.csv 每集一行: verdict=keep|exclude + 理由（05 合并消费）
-  - summary.json            机器可读
+  - summary.json            机器可读（含 joint_observation）
 
 用法:
     python3 pipe/03_clean.py --input <dataset> [--input ...] [--config config.yaml]
-          [--blur] [--no-video-check]
+          [--blur] [--no-video-check] [--joints]
 """
 from __future__ import annotations
 
@@ -224,6 +230,64 @@ def blur_check(video_summary: dict, qc: dict) -> dict[str, Any]:
     return out
 
 
+# ---------------------------------------------------------------- 关节观测量（只测不判）
+def _joint_observation(df: "pd.DataFrame", nominal_fps: float) -> dict:
+    """数组列数据集上的关节观测量：只看数值，不参与 keep/exclude 判定。
+
+    真实 v2.1/v3.0 的 action / observation.state 是"每行一个数组"，没有关节名，
+    因此无法豁免夹爪维度 → 关节限位/跳变/卡死阈值必须先按本观测量定标，
+    再用 --joints 打开判定（默认关闭，避免未经定标就误杀）。
+    """
+    cols, J = _state_arrays(df)
+    if not cols or not J.size:
+        return {}
+    with np.errstate(all="ignore"):
+        max_abs = float(np.nanmax(np.abs(J)))
+        jd = np.abs(np.diff(J, axis=0))
+        max_jump = float(np.nanmax(jd)) if jd.size else 0.0
+        eq = np.diff(J, axis=0) == 0
+        longest = 0
+        if eq.size:
+            for c in range(eq.shape[1]):
+                cnt = mx = 0
+                for v in eq[:, c]:
+                    cnt = cnt + 1 if v else 0
+                    mx = max(mx, cnt)
+                longest = max(longest, mx)
+    dt = (1.0 / nominal_fps) if nominal_fps else 0.0
+    return {
+        "n_joint_cols": len(cols),
+        "max_abs_rad": round(max_abs, 3),
+        "max_jump_rad": round(max_jump, 3),
+        "longest_stuck_s": round(longest * dt, 3),
+    }
+
+
+def _merge_joint_obs(per_ep: list[tuple[int, dict]], qc: dict) -> dict:
+    """把逐集观测量汇总成数据集级（取最坏），并附当前阈值供对照定标。"""
+    if not per_ep:
+        return {}
+    worst_jump = max(per_ep, key=lambda t: t[1].get("max_jump_rad", 0.0))
+    worst_abs = max(per_ep, key=lambda t: t[1].get("max_abs_rad", 0.0))
+    worst_stuck = max(per_ep, key=lambda t: t[1].get("longest_stuck_s", 0.0))
+    return {
+        "n_joint_cols": per_ep[0][1].get("n_joint_cols"),
+        "max_abs_rad": worst_abs[1].get("max_abs_rad"),
+        "max_abs_episode": worst_abs[0],
+        "max_jump_rad": worst_jump[1].get("max_jump_rad"),
+        "max_jump_episode": worst_jump[0],
+        "longest_stuck_s": worst_stuck[1].get("longest_stuck_s"),
+        "longest_stuck_episode": worst_stuck[0],
+        "thresholds": {
+            "joint_limits_rad": qc.get("joint_limits_rad"),
+            "joint_jump_rad": qc.get("joint_jump_rad"),
+            "stuck_s": qc.get("stuck_s"),
+        },
+        "note": ("数组列数据无关节名（无法豁免夹爪），关节类判定默认关闭；"
+                 "对照上面两个数定标后再用 --joints 打开"),
+    }
+
+
 # ---------------------------------------------------------------- 主流程
 def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
     if dataset_io.detect_dataset(ds)[0] == "v3.0":
@@ -243,10 +307,19 @@ def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
         except ImportError:
             print(f"[WARN] 未安装 opencv，{ds.name} 的模糊检查跳过（pip install opencv-python-headless）")
 
+    # 真实 v2.1 的 action / observation.state 是"每行一个数组"的 object 列：
+    # 展开成 action.0…N 后 NaN/Inf 与关节类检查才真正生效（见 2026-09 审计）。
+    has_arrays = dataset_io.has_array_features(eps_paths[0] if eps_paths else None)
+    joints_on = bool(args.joints) or not has_arrays
+    if has_arrays:
+        print(f"[i] {ds.name}: 检测到数组列特征（action/observation.state 无关节名）"
+              f"→ 已展开后检查 NaN/Inf；关节类判定 {'开启(--joints)' if args.joints else '默认关闭（只测量，见 qc_report）'}")
+
     ep_rows = []
+    ep_joint_obs: list[tuple[int, dict]] = []
     for p in eps_paths:
         ep_idx = dataset_io.episode_index(p)
-        df = pd.read_parquet(p)
+        df = dataset_io.expand_array_features(pd.read_parquet(p))
         n_rows = len(df)
         # 视频摘要（帧数/缺失/mismatch）与模糊共用一次探测
         rel = str(p.relative_to(ds))
@@ -265,7 +338,11 @@ def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
             else:
                 fr = video_utils.count_frames(cand)
                 vsum[cam] = {"frames": fr, "missing": False, "path": cand}
-        q = check_episode(df, info, qc, nominal, vsum)
+        q = check_episode(df, info, qc, nominal, vsum, check_joints=joints_on)
+        if has_arrays and not joints_on:
+            obs = _joint_observation(df, nominal)
+            if obs:
+                ep_joint_obs.append((ep_idx, obs))
         if do_blur:
             b = blur_check(vsum, qc)
             if b.get("_bad"):
@@ -279,11 +356,13 @@ def run_dataset(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
     n_excl = len(ep_rows) - n_keep
 
     out_root = Path(args.out) if args.out else dataset_io.new_stage_dir(ds, "clean")
-    return _finalize_qc(ds, out_root, ep_rows, nominal, n_keep, n_excl)
+    return _finalize_qc(ds, out_root, ep_rows, nominal, n_keep, n_excl,
+                        joint_obs=_merge_joint_obs(ep_joint_obs, qc))
 
 
 def _finalize_qc(ds: Path, out_root: Path, ep_rows: list[dict], nominal: float,
-                 n_keep: int | None = None, n_excl: int | None = None) -> dict:
+                 n_keep: int | None = None, n_excl: int | None = None,
+                 joint_obs: dict | None = None) -> dict:
     """写 episode_disposition.csv / summary.json / qc_report.md（v2.1/v3.0 共用）。"""
     if n_keep is None:
         n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
@@ -309,6 +388,8 @@ def _finalize_qc(ds: Path, out_root: Path, ep_rows: list[dict], nominal: float,
         "excluded_episodes": [e["episode"] for e in ep_rows if e["_qc"]["verdict"] == "exclude"],
         "disposition_csv": str(out_root / "episode_disposition.csv"),
     }
+    if joint_obs:
+        summary["joint_observation"] = joint_obs
     report.write_json(out_root / "summary.json", summary)
 
     md = [
@@ -322,7 +403,24 @@ def _finalize_qc(ds: Path, out_root: Path, ep_rows: list[dict], nominal: float,
         q = e["_qc"]
         why = "; ".join(q["reasons_exclude"] + [f"⚠ {w}" for w in q["reasons_warn"]]) or "✓"
         md.append(f"| {e['episode']} | {e['n_rows']} | {q['duration_s']:.2f} | {q['verdict']} | {why} |")
-    md += ["", "## 说明", "", "- 软标记：本脚本未修改任何数据文件；05 合并时按 episode_disposition.csv 排除 exclude 集。", ""]
+    if joint_obs:
+        th = joint_obs.get("thresholds", {})
+        md += [
+            "", "## 关节观测量（只测量，未参与判定）", "",
+            "数组列数据没有关节名、无法豁免夹爪维度，故关节类判定默认关闭。"
+            "先看下面的实测值，再决定 `qc.*` 阈值并用 `--joints` 打开判定。", "",
+            "| 观测量 | 实测(全数据集最坏) | 出现在 | 当前阈值 |", "|---|---|---|---|",
+            f"| max 关节角绝对值 (rad) | {joint_obs.get('max_abs_rad')} | ep {joint_obs.get('max_abs_episode')} "
+            f"| joint_limits_rad={th.get('joint_limits_rad')} |",
+            f"| max 相邻帧跳变 (rad) | {joint_obs.get('max_jump_rad')} | ep {joint_obs.get('max_jump_episode')} "
+            f"| joint_jump_rad={th.get('joint_jump_rad')} |",
+            f"| 最长零方差持续 (s) | {joint_obs.get('longest_stuck_s')} | ep {joint_obs.get('longest_stuck_episode')} "
+            f"| stuck_s={th.get('stuck_s')} |",
+            f"| 关节维度数 | {joint_obs.get('n_joint_cols')} | — | — |",
+            "",
+        ]
+    md += ["", "## 说明", "", "- 软标记：本脚本未修改任何数据文件；05 合并时按 episode_disposition.csv 排除 exclude 集。",
+           "- 数组列（action/observation.state）已展开后检查 NaN/Inf；v2.1 与 v3.0 行为一致。", ""]
     report.write_md(out_root / "qc_report.md", md)
     return summary
 
@@ -343,20 +441,28 @@ def _run_dataset_v30(ds: Path, qc: dict, args: argparse.Namespace) -> dict:
 
     if do_videos and video_utils.FFPROBE is None:
         print(f"[WARN] ffprobe 不可用，{ds.name} 的视频帧数核对跳过（sudo apt install ffmpeg）")
-    print(f"[INFO] {ds.name} 为 v3.0，关节限位/跳变/卡死检查跳过（与数组列 v2.1 行为一致）")
+    joints_on = bool(args.joints)
+    print(f"[INFO] {ds.name} 为 v3.0，数组列已展开；关节类判定 "
+          f"{'开启(--joints)' if joints_on else '默认关闭（只测量，见 qc_report）'}")
     vid_by_ep = (dataset_io._v3_episode_video_summary(ds, eps_meta, cams)
                  if do_videos else {})
     ep_rows = []
+    ep_joint_obs: list[tuple[int, dict]] = []
     for ep, df in dataset_io.iter_v3_episodes(ds):
         vsum = vid_by_ep.get(ep, {})
-        q = check_episode(df, info, qc, nominal, vsum, check_joints=False)
+        q = check_episode(df, info, qc, nominal, vsum, check_joints=joints_on)
+        if not joints_on:
+            obs = _joint_observation(df, nominal)
+            if obs:
+                ep_joint_obs.append((ep, obs))
         ep_rows.append({"episode": ep, "n_rows": len(df), "_qc": q, "videos": vsum})
 
     ep_rows.sort(key=lambda x: x["episode"])
     n_keep = sum(1 for e in ep_rows if e["_qc"]["verdict"] == "keep")
     n_excl = len(ep_rows) - n_keep
     out_root = Path(args.out) if args.out else dataset_io.new_stage_dir(ds, "clean")
-    return _finalize_qc(ds, out_root, ep_rows, nominal, n_keep, n_excl)
+    return _finalize_qc(ds, out_root, ep_rows, nominal, n_keep, n_excl,
+                        joint_obs=_merge_joint_obs(ep_joint_obs, qc))
 
 
 def main() -> int:
@@ -365,6 +471,9 @@ def main() -> int:
     ap.add_argument("--config", default="config.yaml")
     ap.add_argument("--fps", type=float, default=None)
     ap.add_argument("--no-video-check", action="store_true")
+    ap.add_argument("--joints", action="store_true",
+                    help="数组列数据（无关节名）也启用关节限位/跳变/卡死判定。"
+                         "默认关闭：先用报告里的『关节观测量』定标 qc.* 阈值，再打开")
     ap.add_argument("--blur", action="store_true", help="开启模糊帧检查（需 cv2，逐视频抽帧，较慢）")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()

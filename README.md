@@ -2,7 +2,7 @@
 
 机器人**采集数据的处理 + 登记**流水线，适用于 LeRobot **v2.1 / v3.0** 数据集（innov / ARX 双臂）。
 
-- 处理：`pipe/` —— 盘点 → 时间戳审计 → 清洗质检 → 合并 → VLM 标注 → 转 v3.0 → 校验 → 打包交付
+- 处理：`pipe/` —— 盘点 → 时间戳审计 → 清洗质检 → **第二意见(lerobot-doctor)** → 合并 → VLM 标注 → 转 v3.0 → 校验 → 打包交付
 - 登记：`ledger/` —— 每个最终数据集生成"登记卡" → 台账 `data_catalog.csv` → 多机台账汇总
 
 全部是命令行脚本，**克隆即用**：`git clone` → `bash setup.sh` → `cp config.example.yaml config.yaml` 改路径 → `python3 run.py` 菜单式操作。另有本地 Web 界面（回放/盲审/台账/一键动作）。
@@ -30,6 +30,7 @@ bash tools/self_test.sh              # 一键自测：全绿 = 这台机器环�
 python3 run.py                       # 菜单：列数据 → 选动作 → 选编号，全程点选
 python3 run.py list                  # 只看数据+状态（状态 ✓ 表示已跑过哪步）
 python3 run.py clean 1,2             # 清洗质检批次 1、2（编号见 list）
+python3 run.py doctor 4              # 第二意见：lerobot-doctor 只读体检（需 pip install lerobot-doctor）
 python3 run.py merge 1,2,3           # 合并：想合并哪些就勾哪些（≥2 批）
 python3 run.py convert 4             # 转 v3.0（输出组的合并产物；自动留 v2.1 备份）
 python3 run.py verify 4             # 校验：结构 smoke + 数据集 sha256 清单（转完必跑）
@@ -65,6 +66,7 @@ python3 web/app.py                   # 本地 Web：默认 http://127.0.0.1:8000
 
 - **输入布局**：标准 v2.1（`meta/` + `data/chunk-*/episode_*.parquet` + `videos/chunk-*/<cam>/*.mp4`）；转换后的 v3.0 同可被 01/02/03/标注/登记处理。
 - **合并（05）**：勾选 ≥2 个 v2.1 批次；自动按各批清洗清单（`<批>_products/clean/episode_disposition.csv`，兼容旧 `<批>_clean/`）排除坏集；机型/帧率/features 不一致会拒绝；输出自动命名 `{task}_{robot}_{MMDD[-MMDD]}_{N}cam_v{ver}`，已存在会拦截（`--overwrite` 覆盖）。
+- **第二意见（11）**：包装官方生态的 `lerobot-doctor`（只读 `check`）做独立体检——补上自研 03 覆盖不到的 action 级异常（尖峰/僵死/零方差维度/策略兼容性/URDF 动力学/per-episode 明细）。默认把被点名的 `keep` 集降级为 `review`（05 只排除 `exclude`，`review` 不会被删），**绝不自动排除**；也绝不调用 doctor 的 `fix`/`trim`（那两个会改数据）。装不上就让这一步跳过，不影响其它步骤。
 - **转换（06，仅采集机）**：包装官方 `convert_dataset_v21_to_v30.py`（自动探测调用方式）；`--push-to-hub=false` 本地转；官方转换器需要 `meta/episodes_stats.jsonl`，缺时自动补算；`--check` 先预检再转。
 - **标注（09）**：VLM（OpenAI 兼容接口，可接 DeepSeek/通义）逐集评分+建议，**只读**；未启用/缺 Key 会明确拦截。
 - **登记（默认时机：数据处理达标后）**：`--stage final`（默认，质量 `clean`，一条台账 = 一个最终数据）；`--stage raw`（可选，每原始批次一行）。防呆：非 v2.1/v3.0、空数据集、假日期、批次号重复都会拦截。
@@ -83,6 +85,7 @@ python3 web/app.py                   # 本地 Web：默认 http://127.0.0.1:8000
 | 03 `--blur` 模糊检查 | opencv | setup.sh 可选行自动尝试装 |
 | 06 转换 v2.1→v3.0 | **lerobot 环境** | **只用采集机能跑**（conda `lerobot_arx_sdk311`）；其他机器会明确报错提示 |
 | 09 VLM 标注 | 仅标准库 + 网络 + API Key | 配好 config annotate 段即可 |
+| 11 第二意见 | `lerobot-doctor`（本仓库不打包） | `uv tool install lerobot-doctor` 或 `pip install --user lerobot-doctor`；找不到时报错跳过 |
 | Web（回放/盲审/台账） | flask（回放另需 rerun-sdk） | setup.sh 可选行自动装；不跑 Web 可忽略 |
 
 另外三点：**私有仓库**需要各机配 GitHub 认证（SSH key 或 PAT），想零认证可直接把仓库改公开；**Python ≥ 3.10**（Ubuntu 22.04+ 自带）；每台机器第一次 clone 后跑 `self_test.sh`，全绿即环境 OK。
@@ -96,7 +99,7 @@ innov-dataprep/
 │   ├── lib/                    # dataset_io(识别/摘要/产物布局) video_utils(ffprobe)
 │   │                           # report suggest(VLM引擎) replay(回放)
 │   ├── 01_inspect.py 02_timestamps.py 03_clean.py   # 轻检查（只读）
-│   ├── 05_merge.py 06_convert.py 07_verify.py 08_pack.py 09_annotate.py
+│   ├── 05_merge.py 06_convert.py 07_verify.py 08_pack.py 09_annotate.py 11_doctor.py
 │   └── migrate_products.py     # 旧平铺产物 → _products/ 一次性迁移
 ├── web/                        # Flask 本地界面（app.py 入口 + backend.py API）
 ├── ledger/record.py aggregate.py   # 登记卡 / 台账汇总
@@ -116,6 +119,8 @@ python3 tools/check_config.py        # 配置体检
 ## 8. Roadmap
 
 - [x] 01/02/03 轻检查（v2.1+v3.0，只读软标记）· 05 合并 · 06 转换（官方转换器）
+- [x] **数组列修复（2026-09）**：真实 v2.1 的 `action`/`observation.state` 是"每行一个数组"的 object 列，旧实现按 dtype/点分前缀选列 → NaN/Inf 与关节类检查在真实数据上不触发。现统一 `expand_array_features()` 展开后再查；关节类判定因无关节名（无法豁免夹爪）默认关闭，只输出「关节观测量」供定标，`--joints` 才参与判定
+- [x] 11 第二意见（lerobot-doctor 只读体检，可联动把 keep 降级为 review）
 - [x] 09 标注（VLM，config 门禁）· Web 界面（回放/盲审/台账/一键动作）
 - [x] 07 校验（结构 smoke + 数据集/交付包 sha256，`--delivery` 整包核验）· 08 打包（tar.gz + sha256sums.txt）
 - [x] 登记 + 台账汇总 + 操作留痕 · 产物布局统一（_products/ + 迁移脚本）

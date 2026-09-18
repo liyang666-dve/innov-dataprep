@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -172,13 +173,40 @@ def camera_layout(ds: Path, meta_info: dict[str, Any]) -> dict[str, dict[str, in
 
 
 # ---------------------------------------------------------------- 分集统计
+def _array_stack(s: pd.Series) -> "np.ndarray | None":
+    """object 列（每行一个定长数组，如真实 v2.1 的 action / observation.state）
+    → (n, dim) float64 矩阵；无法解析时返回 None。"""
+    try:
+        arr = np.stack([np.asarray(x, dtype=np.float64) for x in s.to_numpy()])
+    except Exception:  # noqa: BLE001
+        return None
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    return arr if arr.ndim == 2 else None
+
+
 def _nan_summary(df: pd.DataFrame) -> tuple[int, list[str]]:
-    cols = [c for c in df.columns if c not in KEY_COLUMNS and df[c].dtype.kind in "fc"]
-    if not cols:
-        return 0, []
-    bad = df[cols].isna()
-    n = int(bad.values.sum())
-    cols_with = [c for c in cols if bool(bad[c].any())]
+    """非有限值(NaN/Inf)统计：数值标量列 + 数组列。
+
+    真实 LeRobot v2.1 把 action / observation.state 存成"每行一个数组"的 object 列，
+    只按 dtype.kind in "fc" 选列会整列漏掉（历史上该检查在真实数据上恒为 0）。
+    """
+    n = 0
+    cols_with: list[str] = []
+    for c in df.columns:
+        if c in KEY_COLUMNS:
+            continue
+        kind = df[c].dtype.kind
+        if kind in "fc":
+            k = int(df[c].isna().sum())
+        elif kind == "O":
+            arr = _array_stack(df[c])
+            k = 0 if arr is None else int((~np.isfinite(arr)).sum())
+        else:
+            continue
+        if k:
+            n += k
+            cols_with.append(c)
     return n, cols_with[:10]
 
 
@@ -394,22 +422,43 @@ def parse_date_range(name: str) -> tuple[str, str] | None:
 
 
 def compute_episode_stats(df: pd.DataFrame, episode_index: int) -> dict[str, Any]:
-    """按真实 robodeploy v2.1 格式生成一行 episodes_stats.jsonl。
+    """按**官方** LeRobot v2.1 episodes_stats.jsonl 结构生成一行。
 
-    {"episode_index": n, "stats": {feature: {min, max, mean, std, count}}}
-    只统计数值特征列（跳过 KEY_COLUMNS），官方 v2.1→v3.0 转换器硬性需要此文件。
+    格式（与 robodeploy 真实产物一致，官方 v2.1→v3.0 转换器硬性需要此文件）：
+      {"episode_index": n,
+       "stats": {feature: {"min": [...], "max": [...], "mean": [...],
+                           "std": [...], "count": [n]}}}
+    每个统计量都是**列表**（逐维），标量特征写成单元素列表。
+    数组列（真实 v2.1 的 action / observation.state）按维展开后逐维统计。
+    视频特征无法从 parquet 计算，跳过（由采集端写入 stats）。
     """
-    cols = [c for c in df.columns if c not in KEY_COLUMNS and df[c].dtype.kind in "fc"]
     stats: dict[str, Any] = {}
-    for c in cols:
+    for c in df.columns:
         s = df[c]
-        cnt = int(s.count())
-        if cnt == 0:
+        kind = s.dtype.kind
+        if kind in "fciub":
+            arr = s.to_numpy(dtype=np.float64).reshape(-1, 1)
+        elif kind == "O":
+            st = _array_stack(s)
+            if st is None:
+                continue
+            arr = st
+        else:
             continue
-        stats[c] = {
-            "min": float(s.min()), "max": float(s.max()),
-            "mean": float(s.mean()), "std": float(s.std()), "count": cnt,
-        }
+        if not arr.size:
+            continue
+        finite_rows = int(np.isfinite(arr).all(axis=1).sum())
+        if finite_rows == 0:
+            continue
+        with np.errstate(all="ignore"), warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # 全 NaN 维会产生 RuntimeWarning
+            stats[c] = {
+                "min": [float(x) for x in np.nanmin(arr, axis=0)],
+                "max": [float(x) for x in np.nanmax(arr, axis=0)],
+                "mean": [float(x) for x in np.nanmean(arr, axis=0)],
+                "std": [float(x) for x in np.nanstd(arr, axis=0)],
+                "count": [finite_rows],
+            }
     return {"episode_index": int(episode_index), "stats": stats}
 
 
@@ -473,6 +522,46 @@ def _v3_expand_v21(df: pd.DataFrame) -> pd.DataFrame:
             out[f"{prefix}.0"] = stacked
         out = out.drop(columns=[col])
     return out
+
+
+def has_array_features(parquet_path: "Path | None") -> bool:
+    """该 parquet 是否把 action / observation.state 存成"每行一个数组"（list 列）？
+
+    真实 robodeploy v2.1 与官方 v3.0 都是这种布局（pandas 读出来是 object 列），
+    而点分列布局（action.left_0）返回 False —— 后者关节名齐全、可直接判定。
+    """
+    if parquet_path is None:
+        return False
+    p = Path(parquet_path)
+    if not p.is_file():
+        return False
+    names = ("action", "observation.state")
+    try:
+        import pyarrow.parquet as pq
+        sch = pq.ParquetFile(p).schema_arrow
+        for name in names:
+            i = sch.get_field_index(name)
+            if i < 0:
+                continue
+            t = str(sch.field(i).type)
+            if t.startswith(("list", "large_list", "fixed_size_list")):
+                return True
+        return False
+    except Exception:  # noqa: BLE001  无 pyarrow 或非常规文件时退回 pandas
+        try:
+            df = pd.read_parquet(p, columns=[c for c in names])
+        except Exception:  # noqa: BLE001
+            return False
+        return any(df[c].dtype.kind == "O" for c in df.columns if c in names)
+
+
+def expand_array_features(df: pd.DataFrame) -> pd.DataFrame:
+    """把"每行一个数组"的特征列（真实 v2.1 的 action / observation.state）展开成
+    v2.1 点分列（action.0…N），使 NaN/Inf、关节类检查在 v2.1 上同样生效。
+
+    对已是点分列或没有数组列的数据集是恒等变换（返回原 df）。
+    """
+    return _v3_expand_v21(df)
 
 
 def iter_v3_episodes(ds: Path):
